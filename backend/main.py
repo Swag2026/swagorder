@@ -1,0 +1,732 @@
+"""
+SWAG Branch Order Portal — Backend
+-----------------------------------
+Each branch employee logs in with their OWN LAROUCHE Odoo credentials (for
+accountability — every order can be traced to who placed it). Their login
+also tells us which company/brand they belong to, so they only ever see
+their own company's outlets (`stock.warehouse`) — never another brand's.
+
+A separate LAROUCHE "admin" service account (server-side only) is used just
+to reliably list warehouses (avoids per-user Odoo access-right edge cases);
+it never determines identity or is exposed to the browser.
+
+Two Odoo systems:
+  1. LAROUCHE Odoo — employee login (identity) + warehouse listing (outlets).
+  2. SWAG Odoo     — the product catalog lives here and the draft Sales
+     Order gets created here, using SWAG's own service account (branches
+     never have their own SWAG login). SWAG's own warehouses are also listed
+     here so the branch can pick which SWAG warehouse fulfills the order.
+
+Because a LAROUCHE outlet (res.company + stock.warehouse) isn't the same
+record as its SWAG customer (res.partner), the backend needs a mapping
+between the two — kept in `branch_partner_map.json` (keyed by LAROUCHE
+stock.warehouse id). It's built automatically where possible (VAT/email/
+phone/location-keyword matching) and falls back to a one-time human pick
+(with full search) otherwise.
+
+Deploy: Railway (this folder as the service root).
+
+Env vars required (Railway → Variables):
+    LAROUCHE_URL            e.g. https://outfit.laroche.sa  (NO trailing /odoo)
+    LAROUCHE_DB             e.g. db3
+    LAROUCHE_ADMIN_USER     LAROUCHE admin-style account email (warehouse listing only)
+    LAROUCHE_ADMIN_API_KEY  that account's password/API key
+    SWAG_URL                e.g. https://db.swag.com.sa     (NO trailing /odoo)
+    SWAG_DB                 e.g. db2
+    SWAG_USER               SWAG service account email (e.g. sharaf@swag.com.sa)
+    SWAG_API_KEY            that service account's API key
+    JWT_SECRET              any long random string
+    ALLOWED_ORIGINS         comma-separated list, e.g. https://swag-branch-orders.netlify.app
+"""
+
+import os
+import json
+import xmlrpc.client
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import jwt
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+LAROUCHE_URL = os.environ.get("LAROUCHE_URL", "").rstrip("/")
+LAROUCHE_DB = os.environ.get("LAROUCHE_DB", "")
+LAROUCHE_ADMIN_USER = os.environ.get("LAROUCHE_ADMIN_USER", "")
+LAROUCHE_ADMIN_API_KEY = os.environ.get("LAROUCHE_ADMIN_API_KEY", "")
+
+SWAG_URL = os.environ.get("SWAG_URL", "").rstrip("/")
+SWAG_DB = os.environ.get("SWAG_DB", "")
+SWAG_USER = os.environ.get("SWAG_USER", "")
+SWAG_API_KEY = os.environ.get("SWAG_API_KEY", "")
+
+JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-railway-variables")
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+
+MAP_FILE = Path(__file__).parent / "branch_partner_map.json"
+
+
+def load_branch_partner_map() -> dict:
+    """{ "<laroche_warehouse_id>": swag_partner_id }"""
+    if not MAP_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(MAP_FILE.read_text())
+        return {str(k): int(v) for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def save_branch_partner_map(mapping: dict) -> None:
+    """Persist a resolved mapping so future selections skip the auto-match
+    search. Best-effort: on ephemeral-filesystem hosts this may not survive a
+    redeploy, but it still avoids repeat lookups during the running instance
+    and gives the admin a file to inspect/edit directly."""
+    try:
+        MAP_FILE.write_text(json.dumps(mapping, indent=2, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+_resolved_cache: dict[str, int] = {}
+
+app = FastAPI(title="SWAG Branch Order Portal API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ODOO HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _proxy(url: str, endpoint: str):
+    return xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/{endpoint}", allow_none=True)
+
+
+def laroche_authenticate(email: str, password: str) -> int:
+    """Authenticate with the EMPLOYEE'S OWN LAROUCHE credentials — this is
+    what gives us accountability (every order traces back to who logged in)."""
+    if not (LAROUCHE_URL and LAROUCHE_DB):
+        raise HTTPException(500, "Server is missing LAROUCHE_URL / LAROUCHE_DB configuration.")
+    try:
+        uid = _proxy(LAROUCHE_URL, "common").authenticate(LAROUCHE_DB, email, password, {})
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
+    if not uid:
+        raise HTTPException(401, "Invalid email or password.")
+    return uid
+
+
+def laroche_execute_as(uid: int, password: str, model: str, method: str, args: list, kwargs: dict | None = None):
+    """Run a call under a specific (already-authenticated) LAROUCHE user."""
+    try:
+        return _proxy(LAROUCHE_URL, "object").execute_kw(
+            LAROUCHE_DB, uid, password, model, method, args, kwargs or {}
+        )
+    except xmlrpc.client.Fault as e:
+        raise HTTPException(400, f"LAROUCHE Odoo error: {e.faultString}")
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
+
+
+_laroche_admin_uid_cache: int | None = None
+
+
+def laroche_admin_uid() -> int:
+    """Authenticate the LAROUCHE admin-style account once and cache the uid.
+    Used ONLY for reliably listing warehouses — never for identity."""
+    global _laroche_admin_uid_cache
+    if _laroche_admin_uid_cache:
+        return _laroche_admin_uid_cache
+    if not (LAROUCHE_URL and LAROUCHE_DB and LAROUCHE_ADMIN_USER and LAROUCHE_ADMIN_API_KEY):
+        raise HTTPException(500, "Server is missing LAROUCHE_ADMIN_USER / LAROUCHE_ADMIN_API_KEY.")
+    try:
+        uid = _proxy(LAROUCHE_URL, "common").authenticate(LAROUCHE_DB, LAROUCHE_ADMIN_USER, LAROUCHE_ADMIN_API_KEY, {})
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
+    if not uid:
+        raise HTTPException(500, "LAROUCHE admin account credentials are invalid.")
+    _laroche_admin_uid_cache = uid
+    return uid
+
+
+def laroche_admin_execute(model: str, method: str, args: list, kwargs: dict | None = None):
+    try:
+        return _proxy(LAROUCHE_URL, "object").execute_kw(
+            LAROUCHE_DB, laroche_admin_uid(), LAROUCHE_ADMIN_API_KEY, model, method, args, kwargs or {}
+        )
+    except xmlrpc.client.Fault as e:
+        raise HTTPException(400, f"LAROUCHE Odoo error: {e.faultString}")
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
+
+
+_swag_uid_cache: int | None = None
+
+
+def swag_uid() -> int:
+    global _swag_uid_cache
+    if _swag_uid_cache:
+        return _swag_uid_cache
+    if not (SWAG_URL and SWAG_DB and SWAG_USER and SWAG_API_KEY):
+        raise HTTPException(500, "Server is missing SWAG_URL / SWAG_DB / SWAG_USER / SWAG_API_KEY.")
+    try:
+        uid = _proxy(SWAG_URL, "common").authenticate(SWAG_DB, SWAG_USER, SWAG_API_KEY, {})
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach SWAG Odoo: {e}")
+    if not uid:
+        raise HTTPException(500, "SWAG service account credentials are invalid.")
+    _swag_uid_cache = uid
+    return uid
+
+
+def swag_execute(model: str, method: str, args: list, kwargs: dict | None = None):
+    try:
+        return _proxy(SWAG_URL, "object").execute_kw(
+            SWAG_DB, swag_uid(), SWAG_API_KEY, model, method, args, kwargs or {}
+        )
+    except xmlrpc.client.Fault as e:
+        raise HTTPException(400, f"SWAG Odoo error: {e.faultString}")
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach SWAG Odoo: {e}")
+
+
+_field_label_cache: dict[str, str | None] = {}
+
+
+def find_field_by_label(model: str, keywords: list[str]) -> str | None:
+    cache_key = f"{model}:{'|'.join(keywords)}"
+    if cache_key in _field_label_cache:
+        return _field_label_cache[cache_key]
+    try:
+        meta = swag_execute(model, "fields_get", [], {"attributes": ["string"]})
+    except Exception:
+        _field_label_cache[cache_key] = None
+        return None
+    keywords_lower = [k.lower() for k in keywords]
+    found = None
+    for fname, finfo in (meta or {}).items():
+        label = (finfo.get("string") or "").lower()
+        if any(kw in label for kw in keywords_lower):
+            found = fname
+            break
+    _field_label_cache[cache_key] = found
+    return found
+
+
+def _m2o_name(value):
+    return value[1] if value else None
+
+
+def _norm(s: str | None) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+
+_GENERIC_NAME_WORDS = {
+    "شركة", "التجارية", "فرع", "فروع", "مؤسسة", "المحدودة", "مجموعة", "متجر", "معرض",
+    "مستودع", "للأزياء", "التجاري", "مصنع", "محل", "مكتب", "co", "company", "trading",
+    "branch", "store", "shop", "warehouse", "ltd", "llc", "est", "establishment",
+}
+
+
+def _brand_keywords(name: str | None) -> set[str]:
+    words = _norm(name).split()
+    # len >= 3 (not 2) — short 2-letter fragments are too easy to coincide
+    # with an unrelated word purely by chance (e.g. a mis-spelled variant of
+    # the brand name matching a completely unrelated record).
+    return {w for w in words if w not in _GENERIC_NAME_WORDS and len(w) >= 3}
+
+
+def _clean_warehouse_name(name: str) -> str:
+    """Warehouse names look like 'W101/ مستودع جدة' or '205/ اوت فيت الامير
+    سلطان' — the part before '/' is just an internal code; the part after it
+    is the actual outlet name we want to match against SWAG."""
+    if "/" in (name or ""):
+        return name.split("/", 1)[1].strip()
+    return (name or "").strip()
+
+
+def auto_resolve_swag_partner(branch_info: dict):
+    """
+    Try to find the ONE SWAG res.partner that corresponds to this outlet.
+    Checks VAT, email, mobile, phone, exact name (in that order) — the first
+    that returns EXACTLY ONE match wins. VAT is often shared by an entire
+    legal entity across many outlets AND sibling brands, so an ambiguous VAT
+    result does NOT stop us from trying the other identifiers.
+
+    If still ambiguous, candidates are SCORED by how many meaningful words
+    they share with the outlet's own (location-specific) name — e.g. a
+    warehouse named "Outfit - Prince Sultan St" should uniquely outscore
+    "Outfit - Jeddah warehouse" on shared words. Only a clear single top
+    scorer is auto-accepted; ties are left for a human to pick from.
+
+    Returns (partner_id, partner_name, matched_on, candidates).
+    """
+    steps = []
+    if branch_info.get("vat"):
+        steps.append(("vat", [["vat", "=", branch_info["vat"]]]))
+    if branch_info.get("email"):
+        steps.append(("email", [["email", "=", branch_info["email"]]]))
+    if branch_info.get("mobile"):
+        steps.append(("mobile", [["mobile", "=", branch_info["mobile"]]]))
+    if branch_info.get("phone"):
+        steps.append(("phone", [["phone", "=", branch_info["phone"]]]))
+    if branch_info.get("name"):
+        steps.append(("name (exact)", [["name", "=", branch_info["name"]]]))
+
+    best_candidates: list[dict] = []
+    for label, domain in steps:
+        matches = swag_execute("res.partner", "search_read", [domain],
+                                {"fields": ["id", "name", "city", "street", "email", "phone"]})
+        if len(matches) == 1:
+            return matches[0]["id"], matches[0]["name"], label, []
+        if len(matches) > 1:
+            candidates = [{"id": m["id"], "name": m["name"], "city": m.get("city")} for m in matches]
+            if not best_candidates or len(candidates) < len(best_candidates):
+                best_candidates = candidates
+
+    if best_candidates:
+        # Only the outlet's LOCATION-specific words should count — words
+        # that are just the brand/company's own name (e.g. "Outfit") appear
+        # in almost every sibling outlet's name too, so they don't actually
+        # discriminate between outlets and can cause false matches (a
+        # mis-spelled brand fragment coincidentally overlapping with an
+        # unrelated record). We strip those out before scoring.
+        brand_words = _brand_keywords(branch_info.get("company_name"))
+        keywords = _brand_keywords(branch_info.get("name")) - brand_words
+        if keywords:
+            scored = [(c, len(keywords & set(_norm(c["name"]).split()))) for c in best_candidates]
+            scored = [(c, score) for c, score in scored if score > 0]
+            if scored:
+                scored.sort(key=lambda cs: cs[1], reverse=True)
+                top_score = scored[0][1]
+                top_matches = [c for c, score in scored if score == top_score]
+                # A single unique winner on genuine LOCATION keywords (brand
+                # noise already excluded, generic terms already stopword-
+                # filtered) is trustworthy even at just 1 shared word — e.g.
+                # "Jeddah" or "Abhur" alone is highly specific once brand
+                # words are out of the picture.
+                if len(top_matches) == 1:
+                    winner = top_matches[0]
+                    return winner["id"], winner["name"], "location keywords", []
+                best_candidates = [c for c, _ in scored]
+
+    return None, None, None, best_candidates
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTH TOKENS
+# ─────────────────────────────────────────────────────────────────────────────
+def make_login_token(email: str, employee_name: str, company_id: int, company_name: str) -> str:
+    """Short-lived token proving the employee already authenticated with
+    their own LAROUCHE credentials — used while they pick their outlet."""
+    payload = {
+        "type": "login",
+        "email": email,
+        "employee_name": employee_name,
+        "company_id": company_id,
+        "company_name": company_name,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=30),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def read_login_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Your session expired — please log in again.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid login token.")
+    if payload.get("type") != "login":
+        raise HTTPException(401, "Invalid login token.")
+    return payload
+
+
+def make_token(branch_key: str, branch_name: str, swag_partner_id: int, swag_partner_name: str, employee_name: str) -> str:
+    payload = {
+        "type": "session",
+        "branch_key": branch_key,
+        "branch_name": branch_name,
+        "swag_partner_id": swag_partner_id,
+        "swag_partner_name": swag_partner_name,
+        "employee_name": employee_name,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=10),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def make_select_token(branch_key: str, branch_name: str, candidate_ids: list[int], employee_name: str) -> str:
+    payload = {
+        "type": "branch_select",
+        "branch_key": branch_key,
+        "branch_name": branch_name,
+        "candidate_ids": candidate_ids,
+        "employee_name": employee_name,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=15),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def read_token(authorization: str | None) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing or invalid Authorization header.")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Session expired, please log in again.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid session token.")
+    if payload.get("type") != "session":
+        raise HTTPException(401, "Invalid session token.")
+    return payload
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEMAS
+# ─────────────────────────────────────────────────────────────────────────────
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class SelectBranchRequest(BaseModel):
+    login_token: str
+    warehouse_id: int
+
+
+class BranchSearchRequest(BaseModel):
+    select_token: str
+    q: str = ""
+
+
+class ConfirmBranchRequest(BaseModel):
+    select_token: str
+    partner_id: int
+
+
+class CartItem(BaseModel):
+    product_id: int
+    qty: float
+
+
+class OrderRequest(BaseModel):
+    items: list[CartItem]
+    warehouse_id: int | None = None
+    note: str | None = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/health")
+def health():
+    return {"ok": True}
+
+
+@app.post("/api/login")
+def login(body: LoginRequest):
+    """Employee logs in with THEIR OWN LAROUCHE credentials — this is what
+    gives us accountability. We only learn their name + which company/brand
+    they belong to here; they still pick their specific outlet next."""
+    email = body.email.strip()
+    uid = laroche_authenticate(email, body.password)
+    user_recs = laroche_execute_as(uid, body.password, "res.users", "read",
+                                    [[uid]], {"fields": ["name", "company_id"]})
+    if not user_recs:
+        raise HTTPException(500, "Could not load your LAROUCHE user profile.")
+    employee_name = user_recs[0]["name"]
+    company = user_recs[0].get("company_id") or False
+    if not company:
+        raise HTTPException(500, "Your LAROUCHE account has no company/brand assigned — ask an admin to check it.")
+    company_id, company_name = company[0], company[1]
+
+    login_token = make_login_token(email, employee_name, company_id, company_name)
+    return {
+        "login_token": login_token,
+        "employee_name": employee_name,
+        "company_id": company_id,
+        "company_name": company_name,
+    }
+
+
+@app.get("/api/warehouses")
+def list_warehouses(company_id: int, login_token: str):
+    """Every outlet under the LOGGED-IN employee's own company — never lets
+    them browse another brand's outlets."""
+    payload = read_login_token(login_token)
+    if payload["company_id"] != company_id:
+        raise HTTPException(403, "You can only view outlets for your own company.")
+    warehouses = laroche_admin_execute(
+        "stock.warehouse", "search_read", [[["company_id", "=", company_id]]],
+        {"fields": ["id", "name", "code"], "order": "name asc"},
+    )
+    return {"warehouses": warehouses}
+
+
+def _resolve_branch(branch_id: int, branch_name: str, branch_info: dict, employee_name: str):
+    """Shared logic: look up cached mapping, else auto-resolve, else return a
+    selection_required payload."""
+    key = str(branch_id)
+    mapping = load_branch_partner_map()
+    swag_partner_id = mapping.get(key) or _resolved_cache.get(key)
+    matched_on = "saved mapping" if swag_partner_id else None
+
+    if not swag_partner_id:
+        resolved_id, resolved_name, matched_on, candidates = auto_resolve_swag_partner(branch_info)
+        if not resolved_id:
+            select_token = make_select_token(key, branch_name, [c["id"] for c in candidates], employee_name)
+            return {
+                "selection_required": True,
+                "select_token": select_token,
+                "branch_name": branch_name,
+                "candidates": candidates[:40],
+            }
+        swag_partner_id = resolved_id
+        _resolved_cache[key] = swag_partner_id
+        mapping[key] = swag_partner_id
+        save_branch_partner_map(mapping)
+
+    partner_recs = swag_execute("res.partner", "read", [[swag_partner_id]], {"fields": ["name"]})
+    if not partner_recs:
+        raise HTTPException(500, f"Mapped SWAG partner id {swag_partner_id} was not found in SWAG Odoo.")
+    swag_partner_name = partner_recs[0]["name"]
+
+    token = make_token(key, branch_name, swag_partner_id, swag_partner_name, employee_name)
+    return {
+        "token": token,
+        "partner_name": swag_partner_name,
+        "branch_name": branch_name,
+        "matched_on": matched_on,
+    }
+
+
+@app.post("/api/select-branch")
+def select_branch(body: SelectBranchRequest):
+    login_payload = read_login_token(body.login_token)
+    warehouses = laroche_admin_execute(
+        "stock.warehouse", "read", [[body.warehouse_id]], {"fields": ["name", "company_id"]}
+    )
+    if not warehouses:
+        raise HTTPException(404, "Outlet not found.")
+    warehouse = warehouses[0]
+    if not warehouse.get("company_id") or warehouse["company_id"][0] != login_payload["company_id"]:
+        raise HTTPException(403, "This outlet doesn't belong to your company.")
+
+    outlet_name = _clean_warehouse_name(warehouse["name"])
+    branch_name = f"{login_payload['company_name']} — {outlet_name}"
+
+    branch_info = {"name": outlet_name, "company_name": login_payload["company_name"]}
+    company = laroche_admin_execute(
+        "res.company", "read", [[login_payload["company_id"]]], {"fields": ["partner_id"]}
+    )
+    company_partner = company[0].get("partner_id") if company else False
+    if company_partner:
+        p = laroche_admin_execute(
+            "res.partner", "read", [[company_partner[0]]],
+            {"fields": ["email", "phone", "mobile", "vat"]},
+        )
+        if p:
+            branch_info.update({k: p[0].get(k) for k in ("email", "phone", "mobile", "vat")})
+
+    return _resolve_branch(body.warehouse_id, branch_name, branch_info, login_payload["employee_name"])
+
+
+@app.post("/api/branch-select/search")
+def branch_select_search(body: BranchSearchRequest):
+    try:
+        payload = jwt.decode(body.select_token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "This selection expired — please pick your outlet again.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid selection token.")
+    if payload.get("type") != "branch_select":
+        raise HTTPException(401, "Invalid selection token.")
+
+    q = body.q.strip()
+    domain = [["name", "ilike", q]] if q else []
+    results = swag_execute(
+        "res.partner", "search_read", [domain],
+        {"fields": ["id", "name", "city", "street"], "limit": 25, "order": "name asc"},
+    )
+    return {"results": results}
+
+
+@app.post("/api/confirm-branch")
+def confirm_branch(body: ConfirmBranchRequest):
+    try:
+        payload = jwt.decode(body.select_token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "This selection expired — please pick your outlet again.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid selection token.")
+    if payload.get("type") != "branch_select":
+        raise HTTPException(401, "Invalid selection token.")
+
+    partner_recs = swag_execute("res.partner", "read", [[body.partner_id]], {"fields": ["name"]})
+    if not partner_recs:
+        raise HTTPException(500, f"SWAG partner id {body.partner_id} was not found.")
+    swag_partner_name = partner_recs[0]["name"]
+
+    key = payload["branch_key"]
+    mapping = load_branch_partner_map()
+    mapping[key] = body.partner_id
+    _resolved_cache[key] = body.partner_id
+    save_branch_partner_map(mapping)
+
+    branch_name = payload.get("branch_name", key)
+    employee_name = payload.get("employee_name", "")
+    token = make_token(key, branch_name, body.partner_id, swag_partner_name, employee_name)
+    return {
+        "token": token,
+        "partner_name": swag_partner_name,
+        "branch_name": branch_name,
+        "matched_on": "confirmed by human",
+    }
+
+
+@app.get("/api/me")
+def me(authorization: str | None = Header(None)):
+    payload = read_token(authorization)
+    return {
+        "partner_name": payload["swag_partner_name"],
+        "branch_name": payload["branch_name"],
+        "employee_name": payload.get("employee_name"),
+    }
+
+
+@app.get("/api/products")
+def search_products(q: str = "", limit: int = 40, authorization: str | None = Header(None)):
+    read_token(authorization)
+    domain = [["sale_ok", "=", True]]
+    q = (q or "").strip()
+    if q:
+        domain = ["&", domain[0], "|", ["default_code", "ilike", q], ["name", "ilike", q]]
+    fields = ["id", "default_code", "name", "list_price", "qty_available", "uom_id"]
+    products = swag_execute(
+        "product.product", "search_read",
+        [domain], {"fields": fields, "limit": limit, "order": "default_code asc"},
+    )
+    return {"products": products}
+
+
+@app.get("/api/products/{product_id}/image")
+def product_image(product_id: int, authorization: str | None = Header(None)):
+    read_token(authorization)
+    recs = swag_execute("product.product", "read", [[product_id]], {"fields": ["image_128"]})
+    image_b64 = recs[0].get("image_128") if recs else None
+    return {"image_base64": image_b64}
+
+
+@app.get("/api/products/{product_id}/stock")
+def product_stock_by_warehouse(product_id: int, authorization: str | None = Header(None)):
+    """How much of this product sits in EACH SWAG warehouse — not just the
+    total. Reads stock.quant (per-location on-hand quantity), then maps each
+    location back to its warehouse."""
+    read_token(authorization)
+
+    quants = swag_execute(
+        "stock.quant", "search_read",
+        [[["product_id", "=", product_id], ["location_id.usage", "=", "internal"], ["quantity", "!=", 0]]],
+        {"fields": ["location_id", "quantity"]},
+    )
+    if not quants:
+        return {"stock_by_warehouse": []}
+
+    location_ids = list({q["location_id"][0] for q in quants if q.get("location_id")})
+    locations = swag_execute("stock.location", "read", [location_ids], {"fields": ["warehouse_id"]})
+    loc_to_wh = {loc["id"]: loc.get("warehouse_id") for loc in locations}
+
+    totals: dict[tuple, float] = {}
+    for q in quants:
+        loc = q.get("location_id")
+        if not loc:
+            continue
+        wh = loc_to_wh.get(loc[0])
+        key = (wh[0], wh[1]) if wh else (None, "Other / Unassigned")
+        totals[key] = totals.get(key, 0) + q["quantity"]
+
+    result = [
+        {"warehouse_id": wh_id, "warehouse_name": wh_name, "quantity": qty}
+        for (wh_id, wh_name), qty in totals.items()
+        if qty  # drop zero totals after summing
+    ]
+    result.sort(key=lambda r: r["warehouse_name"] or "")
+    return {"stock_by_warehouse": result}
+
+
+@app.get("/api/swag-warehouses")
+def list_swag_warehouses(authorization: str | None = Header(None)):
+    """SWAG's own warehouses — the branch picks which one should fulfill
+    (source stock for) their order."""
+    read_token(authorization)
+    warehouses = swag_execute(
+        "stock.warehouse", "search_read", [[]], {"fields": ["id", "name", "code"], "order": "name asc"}
+    )
+    return {"warehouses": warehouses}
+
+
+@app.post("/api/orders")
+def create_order(body: OrderRequest, authorization: str | None = Header(None)):
+    payload = read_token(authorization)
+    if not body.items:
+        raise HTTPException(400, "Cart is empty.")
+
+    order_lines = [
+        (0, 0, {"product_id": item.product_id, "product_uom_qty": item.qty})
+        for item in body.items
+    ]
+    employee_name = payload.get("employee_name") or "unknown"
+    note_lines = [f"Ordered via Branch Portal by {employee_name} ({payload.get('branch_name')})"]
+    if body.note:
+        note_lines.append(body.note)
+
+    vals = {
+        "partner_id": payload["swag_partner_id"],
+        "order_line": order_lines,
+        "note": "\n".join(note_lines),
+    }
+    if body.warehouse_id:
+        vals["warehouse_id"] = body.warehouse_id
+
+    order_id = swag_execute("sale.order", "create", [vals], {})
+
+    detail_fields = [
+        "name", "partner_id", "partner_invoice_id", "partner_shipping_id",
+        "pricelist_id", "payment_term_id", "user_id", "date_order",
+        "amount_untaxed", "amount_tax", "amount_total", "state", "warehouse_id",
+    ]
+    collector_field = find_field_by_label("sale.order", ["collector"])
+    if collector_field and collector_field not in detail_fields:
+        detail_fields.append(collector_field)
+
+    rec = swag_execute("sale.order", "read", [[order_id]], {"fields": detail_fields})
+    order = rec[0] if rec else {}
+
+    details = {
+        "order_name": order.get("name"),
+        "customer": _m2o_name(order.get("partner_id")),
+        "invoice_address": _m2o_name(order.get("partner_invoice_id")),
+        "delivery_address": _m2o_name(order.get("partner_shipping_id")),
+        "pricelist": _m2o_name(order.get("pricelist_id")),
+        "payment_terms": _m2o_name(order.get("payment_term_id")),
+        "salesperson": _m2o_name(order.get("user_id")),
+        "warehouse": _m2o_name(order.get("warehouse_id")),
+        "collector": _m2o_name(order.get(collector_field)) if collector_field else None,
+        "order_date": order.get("date_order"),
+        "amount_untaxed": order.get("amount_untaxed"),
+        "amount_tax": order.get("amount_tax"),
+        "amount_total": order.get("amount_total"),
+        "state": order.get("state"),
+        "ordered_by": employee_name,
+    }
+    return {"order_id": order_id, "order_name": details["order_name"] or str(order_id), "details": details}
