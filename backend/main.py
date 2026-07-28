@@ -50,6 +50,8 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import database
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -502,6 +504,7 @@ def _resolve_branch(branch_id: int, branch_name: str, branch_info: dict, employe
     swag_partner_name = partner_recs[0]["name"]
 
     token = make_token(key, branch_name, swag_partner_id, swag_partner_name, employee_name)
+    database.log_login(key, branch_name, employee_name, swag_partner_id, swag_partner_name)
     return {
         "token": token,
         "partner_name": swag_partner_name,
@@ -586,6 +589,7 @@ def confirm_branch(body: ConfirmBranchRequest):
     branch_name = payload.get("branch_name", key)
     employee_name = payload.get("employee_name", "")
     token = make_token(key, branch_name, body.partner_id, swag_partner_name, employee_name)
+    database.log_login(key, branch_name, employee_name, body.partner_id, swag_partner_name)
     return {
         "token": token,
         "partner_name": swag_partner_name,
@@ -729,4 +733,168 @@ def create_order(body: OrderRequest, authorization: str | None = Header(None)):
         "state": order.get("state"),
         "ordered_by": employee_name,
     }
+
+    database.log_order(
+        swag_order_id=order_id,
+        swag_order_name=details["order_name"] or str(order_id),
+        branch_key=payload["branch_key"],
+        branch_name=payload.get("branch_name"),
+        employee_name=employee_name,
+        swag_partner_id=payload["swag_partner_id"],
+        swag_partner_name=payload.get("swag_partner_name"),
+        warehouse_id=body.warehouse_id,
+        warehouse_name=details.get("warehouse"),
+        item_count=len(body.items),
+        amount_total=order.get("amount_total") or 0,
+        items_json=json.dumps([{"product_id": it.product_id, "qty": it.qty} for it in body.items]),
+    )
+
     return {"order_id": order_id, "order_name": details["order_name"] or str(order_id), "details": details}
+
+
+class BulkLookupRequest(BaseModel):
+    codes: list[str]
+
+
+@app.post("/api/products/bulk-lookup")
+def bulk_lookup_products(body: BulkLookupRequest, authorization: str | None = Header(None)):
+    """Used by the Excel bulk-order upload: given a list of product codes
+    (default_code), find each one's exact match in SWAG. Codes that don't
+    match anything (or match more than one product) are returned separately
+    so the branch can review them by hand — never guessed."""
+    read_token(authorization)
+    codes = [c.strip() for c in body.codes if c and c.strip()]
+    matched = []
+    not_found = []
+    for code in codes:
+        recs = swag_execute(
+            "product.product", "search_read",
+            [[["default_code", "=", code]]],
+            {"fields": ["id", "default_code", "name", "list_price", "qty_available"]},
+        )
+        if len(recs) == 1:
+            matched.append(recs[0])
+        else:
+            not_found.append(code)
+    return {"matched": matched, "not_found": not_found}
+
+
+@app.get("/api/my-orders")
+def my_orders(limit: int = 50, authorization: str | None = Header(None)):
+    """Order history for the logged-in branch's own SWAG customer — powers
+    the 'My Orders' dashboard."""
+    payload = read_token(authorization)
+    orders = swag_execute(
+        "sale.order", "search_read",
+        [[["partner_id", "=", payload["swag_partner_id"]]]],
+        {
+            "fields": ["id", "name", "date_order", "amount_total", "state", "warehouse_id"],
+            "order": "date_order desc",
+            "limit": limit,
+        },
+    )
+    for o in orders:
+        o["warehouse"] = _m2o_name(o.pop("warehouse_id", None))
+    return {"orders": orders}
+
+
+@app.get("/api/orders/{order_id}")
+def order_detail(order_id: int, authorization: str | None = Header(None)):
+    """Full detail (including line items) for one order in the dashboard.
+    Scoped to the logged-in branch's own SWAG customer — can't look up an
+    arbitrary order id belonging to someone else."""
+    payload = read_token(authorization)
+    recs = swag_execute(
+        "sale.order", "read", [[order_id]],
+        {"fields": ["id", "name", "partner_id", "date_order", "amount_untaxed",
+                    "amount_tax", "amount_total", "state", "warehouse_id", "note"]},
+    )
+    if not recs:
+        raise HTTPException(404, "Order not found.")
+    order = recs[0]
+    if not order.get("partner_id") or order["partner_id"][0] != payload["swag_partner_id"]:
+        raise HTTPException(403, "This order doesn't belong to your outlet.")
+
+    lines = swag_execute(
+        "sale.order.line", "search_read",
+        [[["order_id", "=", order_id], ["display_type", "=", False]]],
+        {"fields": ["product_id", "name", "product_uom_qty", "price_unit", "price_subtotal"]},
+    )
+    line_items = [
+        {
+            "product_id": ln["product_id"][0] if ln.get("product_id") else None,
+            "product_name": ln["product_id"][1] if ln.get("product_id") else ln.get("name"),
+            "qty": ln["product_uom_qty"],
+            "price_unit": ln["price_unit"],
+            "subtotal": ln["price_subtotal"],
+        }
+        for ln in lines
+    ]
+    return {
+        "id": order["id"],
+        "name": order["name"],
+        "date_order": order.get("date_order"),
+        "warehouse": _m2o_name(order.get("warehouse_id")),
+        "amount_untaxed": order.get("amount_untaxed"),
+        "amount_tax": order.get("amount_tax"),
+        "amount_total": order.get("amount_total"),
+        "state": order.get("state"),
+        "note": order.get("note"),
+        "lines": line_items,
+    }
+
+
+@app.get("/api/login-history")
+def login_history(limit: int = 50, authorization: str | None = Header(None)):
+    """Every time this branch has logged in — the audit trail requested for
+    accountability, stored in our own tracking database (not Odoo)."""
+    payload = read_token(authorization)
+    db = database.get_session()
+    try:
+        rows = (
+            db.query(database.LoginEvent)
+            .filter(database.LoginEvent.branch_key == payload["branch_key"])
+            .order_by(database.LoginEvent.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return {
+            "logins": [
+                {
+                    "id": r.id,
+                    "employee_name": r.employee_name,
+                    "branch_name": r.branch_name,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in rows
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/order-graph")
+def order_graph(days: int = 30, authorization: str | None = Header(None)):
+    """Daily order count + value for this branch, from our own tracking
+    database (orders placed through this portal) — powers the dashboard
+    chart. This complements /api/my-orders (which reads the full, live
+    authoritative history straight from SWAG)."""
+    payload = read_token(authorization)
+    db = database.get_session()
+    try:
+        rows = (
+            db.query(database.OrderRecord)
+            .filter(database.OrderRecord.branch_key == payload["branch_key"])
+            .order_by(database.OrderRecord.created_at.asc())
+            .all()
+        )
+        by_day: dict[str, dict] = {}
+        for r in rows:
+            day = r.created_at.strftime("%Y-%m-%d")
+            bucket = by_day.setdefault(day, {"date": day, "orders": 0, "total": 0.0})
+            bucket["orders"] += 1
+            bucket["total"] += r.amount_total or 0
+        series = sorted(by_day.values(), key=lambda b: b["date"])
+        return {"series": series[-days:] if days else series}
+    finally:
+        db.close()
