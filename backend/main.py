@@ -369,7 +369,8 @@ def read_login_token(token: str) -> dict:
     return payload
 
 
-def make_token(branch_key: str, branch_name: str, swag_partner_id: int, swag_partner_name: str, employee_name: str) -> str:
+def make_token(branch_key: str, branch_name: str, swag_partner_id: int, swag_partner_name: str, employee_name: str,
+                default_warehouse_id: int | None = None, default_warehouse_name: str | None = None) -> str:
     payload = {
         "type": "session",
         "branch_key": branch_key,
@@ -377,6 +378,8 @@ def make_token(branch_key: str, branch_name: str, swag_partner_id: int, swag_par
         "swag_partner_id": swag_partner_id,
         "swag_partner_name": swag_partner_name,
         "employee_name": employee_name,
+        "default_warehouse_id": default_warehouse_id,
+        "default_warehouse_name": default_warehouse_name,
         "exp": datetime.now(timezone.utc) + timedelta(hours=10),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
@@ -481,12 +484,23 @@ def health():
 @app.post("/api/login")
 def login(body: LoginRequest):
     """Employee logs in with THEIR OWN LAROUCHE credentials — this is what
-    gives us accountability. We only learn their name + which company/brand
-    they belong to here; they still pick their specific outlet next."""
+    gives us accountability. If their own account is already scoped to a
+    specific warehouse (its 'Default Warehouse' field), we resolve straight
+    to that outlet — no company-wide picker, no access beyond their own
+    warehouse. Only accounts without a default warehouse fall back to
+    picking from their company's outlet list."""
     email = body.email.strip()
     uid = laroche_authenticate(email, body.password)
-    user_recs = laroche_execute_as(uid, body.password, "res.users", "read",
-                                    [[uid]], {"fields": ["name", "company_id"]})
+
+    # Read defensively — property_warehouse_id may not exist on every setup.
+    wanted_fields = ["name", "company_id", "property_warehouse_id"]
+    try:
+        meta = laroche_execute_as(uid, body.password, "res.users", "fields_get", [], {"attributes": []})
+        existing_fields = [f for f in wanted_fields if f in meta]
+    except Exception:
+        existing_fields = ["name", "company_id"]
+
+    user_recs = laroche_execute_as(uid, body.password, "res.users", "read", [[uid]], {"fields": existing_fields})
     if not user_recs:
         raise HTTPException(500, "Could not load your LAROUCHE user profile.")
     employee_name = user_recs[0]["name"]
@@ -495,12 +509,22 @@ def login(body: LoginRequest):
         raise HTTPException(500, "Your LAROUCHE account has no company/brand assigned — ask an admin to check it.")
     company_id, company_name = company[0], company[1]
 
+    own_warehouse = user_recs[0].get("property_warehouse_id") or False
+    if own_warehouse:
+        # This login is already scoped to exactly one outlet — resolve
+        # straight through, skipping the picker (and any access to other
+        # outlets under the same brand) entirely.
+        result = _resolve_warehouse_to_session(own_warehouse[0], company_id, company_name, employee_name)
+        result["single_warehouse"] = True
+        return result
+
     login_token = make_login_token(email, employee_name, company_id, company_name)
     return {
         "login_token": login_token,
         "employee_name": employee_name,
         "company_id": company_id,
         "company_name": company_name,
+        "single_warehouse": False,
     }
 
 
@@ -516,6 +540,34 @@ def list_warehouses(company_id: int, login_token: str):
         {"fields": ["id", "name", "code"], "order": "name asc"},
     )
     return {"warehouses": warehouses}
+
+
+def auto_resolve_swag_warehouse(branch_info: dict):
+    """
+    Best-effort: find the ONE SWAG stock.warehouse whose name matches this
+    outlet's own location (same scoring approach as customer matching, but
+    against warehouses, which don't have VAT/email/phone — just names).
+    This is a convenience default (which warehouse's stock to show/assume
+    first), NOT a correctness-critical mapping like the customer match, so
+    if it's not a clear unique winner we simply leave it unset rather than
+    blocking anything — the branch can still pick any warehouse manually.
+    """
+    brand_words = _brand_keywords(branch_info.get("company_name"))
+    keywords = _brand_keywords(branch_info.get("name")) - brand_words
+    if not keywords:
+        return None, None
+
+    all_warehouses = swag_execute("stock.warehouse", "search_read", [[]], {"fields": ["id", "name"]})
+    scored = [(w, len(keywords & set(_norm(_clean_warehouse_name(w["name"])).split()))) for w in all_warehouses]
+    scored = [(w, s) for w, s in scored if s > 0]
+    if not scored:
+        return None, None
+    scored.sort(key=lambda ws: ws[1], reverse=True)
+    top = scored[0][1]
+    winners = [w for w, s in scored if s == top]
+    if len(winners) == 1:
+        return winners[0]["id"], winners[0]["name"]
+    return None, None
 
 
 def _resolve_branch(branch_id: int, branch_name: str, branch_info: dict, employee_name: str):
@@ -546,35 +598,42 @@ def _resolve_branch(branch_id: int, branch_name: str, branch_info: dict, employe
         raise HTTPException(500, f"Mapped SWAG partner id {swag_partner_id} was not found in SWAG Odoo.")
     swag_partner_name = partner_recs[0]["name"]
 
-    token = make_token(key, branch_name, swag_partner_id, swag_partner_name, employee_name)
+    default_warehouse_id, default_warehouse_name = auto_resolve_swag_warehouse(branch_info)
+
+    token = make_token(
+        key, branch_name, swag_partner_id, swag_partner_name, employee_name,
+        default_warehouse_id, default_warehouse_name,
+    )
     database.log_login(key, branch_name, employee_name, swag_partner_id, swag_partner_name)
     return {
         "token": token,
         "partner_name": swag_partner_name,
         "branch_name": branch_name,
         "matched_on": matched_on,
+        "default_warehouse_name": default_warehouse_name,
     }
 
 
-@app.post("/api/select-branch")
-def select_branch(body: SelectBranchRequest):
-    login_payload = read_login_token(body.login_token)
+def _resolve_warehouse_to_session(warehouse_id: int, company_id: int, company_name: str, employee_name: str):
+    """Given a specific stock.warehouse id (already known to belong to
+    company_id), verify it, build the branch_info used for SWAG matching,
+    and resolve/confirm the session. Shared by /api/select-branch and the
+    auto-resolve-on-login path (when an employee's own account is already
+    scoped to one warehouse)."""
     warehouses = laroche_admin_execute(
-        "stock.warehouse", "read", [[body.warehouse_id]], {"fields": ["name", "company_id"]}
+        "stock.warehouse", "read", [[warehouse_id]], {"fields": ["name", "company_id"]}
     )
     if not warehouses:
         raise HTTPException(404, "Outlet not found.")
     warehouse = warehouses[0]
-    if not warehouse.get("company_id") or warehouse["company_id"][0] != login_payload["company_id"]:
+    if not warehouse.get("company_id") or warehouse["company_id"][0] != company_id:
         raise HTTPException(403, "This outlet doesn't belong to your company.")
 
     outlet_name = _clean_warehouse_name(warehouse["name"])
-    branch_name = f"{login_payload['company_name']} — {outlet_name}"
+    branch_name = f"{company_name} — {outlet_name}"
 
-    branch_info = {"name": outlet_name, "company_name": login_payload["company_name"]}
-    company = laroche_admin_execute(
-        "res.company", "read", [[login_payload["company_id"]]], {"fields": ["partner_id"]}
-    )
+    branch_info = {"name": outlet_name, "company_name": company_name}
+    company = laroche_admin_execute("res.company", "read", [[company_id]], {"fields": ["partner_id"]})
     company_partner = company[0].get("partner_id") if company else False
     if company_partner:
         p = laroche_admin_execute(
@@ -584,7 +643,15 @@ def select_branch(body: SelectBranchRequest):
         if p:
             branch_info.update({k: p[0].get(k) for k in ("email", "phone", "mobile", "vat")})
 
-    return _resolve_branch(body.warehouse_id, branch_name, branch_info, login_payload["employee_name"])
+    return _resolve_branch(warehouse_id, branch_name, branch_info, employee_name)
+
+
+@app.post("/api/select-branch")
+def select_branch(body: SelectBranchRequest):
+    login_payload = read_login_token(body.login_token)
+    return _resolve_warehouse_to_session(
+        body.warehouse_id, login_payload["company_id"], login_payload["company_name"], login_payload["employee_name"]
+    )
 
 
 @app.post("/api/branch-select/search")
@@ -631,13 +698,24 @@ def confirm_branch(body: ConfirmBranchRequest):
 
     branch_name = payload.get("branch_name", key)
     employee_name = payload.get("employee_name", "")
-    token = make_token(key, branch_name, body.partner_id, swag_partner_name, employee_name)
+
+    # Best-effort default-warehouse guess: branch_name is "{company} — {outlet}".
+    company_part, _, outlet_part = branch_name.partition(" — ")
+    default_warehouse_id, default_warehouse_name = auto_resolve_swag_warehouse(
+        {"name": outlet_part or branch_name, "company_name": company_part}
+    )
+
+    token = make_token(
+        key, branch_name, body.partner_id, swag_partner_name, employee_name,
+        default_warehouse_id, default_warehouse_name,
+    )
     database.log_login(key, branch_name, employee_name, body.partner_id, swag_partner_name)
     return {
         "token": token,
         "partner_name": swag_partner_name,
         "branch_name": branch_name,
         "matched_on": "confirmed by human",
+        "default_warehouse_name": default_warehouse_name,
     }
 
 
@@ -648,6 +726,8 @@ def me(authorization: str | None = Header(None)):
         "partner_name": payload["swag_partner_name"],
         "branch_name": payload["branch_name"],
         "employee_name": payload.get("employee_name"),
+        "default_warehouse_id": payload.get("default_warehouse_id"),
+        "default_warehouse_name": payload.get("default_warehouse_name"),
     }
 
 
