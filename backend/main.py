@@ -542,16 +542,33 @@ def list_warehouses(company_id: int, login_token: str):
     return {"warehouses": warehouses}
 
 
-def auto_resolve_swag_warehouse(branch_info: dict):
+def auto_resolve_swag_warehouse(branch_info: dict, swag_partner_id: int | None = None):
     """
-    Best-effort: find the ONE SWAG stock.warehouse whose name matches this
-    outlet's own location (same scoring approach as customer matching, but
-    against warehouses, which don't have VAT/email/phone — just names).
+    Find the SWAG stock.warehouse that represents this outlet's own stock.
+    Two strategies, tried in order of reliability:
+
+      1. Direct link — if a SWAG warehouse's own `partner_id` is exactly the
+         customer we already matched this branch to, that's a guaranteed
+         correct link (no guessing at all).
+      2. Name matching — same scoring approach as customer matching, but
+         against warehouse names (which don't have VAT/email/phone).
+
     This is a convenience default (which warehouse's stock to show/assume
     first), NOT a correctness-critical mapping like the customer match, so
-    if it's not a clear unique winner we simply leave it unset rather than
+    if nothing is a clear unique winner we simply leave it unset rather than
     blocking anything — the branch can still pick any warehouse manually.
     """
+    if swag_partner_id:
+        try:
+            direct = swag_execute(
+                "stock.warehouse", "search_read", [[["partner_id", "=", swag_partner_id]]],
+                {"fields": ["id", "name"]},
+            )
+            if len(direct) == 1:
+                return direct[0]["id"], direct[0]["name"]
+        except Exception:
+            pass  # field may not exist on this Odoo setup — fall through to name matching
+
     brand_words = _brand_keywords(branch_info.get("company_name"))
     keywords = _brand_keywords(branch_info.get("name")) - brand_words
     if not keywords:
@@ -598,7 +615,7 @@ def _resolve_branch(branch_id: int, branch_name: str, branch_info: dict, employe
         raise HTTPException(500, f"Mapped SWAG partner id {swag_partner_id} was not found in SWAG Odoo.")
     swag_partner_name = partner_recs[0]["name"]
 
-    default_warehouse_id, default_warehouse_name = auto_resolve_swag_warehouse(branch_info)
+    default_warehouse_id, default_warehouse_name = auto_resolve_swag_warehouse(branch_info, swag_partner_id)
 
     token = make_token(
         key, branch_name, swag_partner_id, swag_partner_name, employee_name,
@@ -702,7 +719,7 @@ def confirm_branch(body: ConfirmBranchRequest):
     # Best-effort default-warehouse guess: branch_name is "{company} — {outlet}".
     company_part, _, outlet_part = branch_name.partition(" — ")
     default_warehouse_id, default_warehouse_name = auto_resolve_swag_warehouse(
-        {"name": outlet_part or branch_name, "company_name": company_part}
+        {"name": outlet_part or branch_name, "company_name": company_part}, body.partner_id
     )
 
     token = make_token(
@@ -805,6 +822,51 @@ def product_stock_by_warehouse(product_id: int, authorization: str | None = Head
     ]
     result.sort(key=lambda r: r["warehouse_name"] or "")
     return {"stock_by_warehouse": result}
+
+
+@app.get("/api/products/{product_id}/my-shop-stock")
+def product_my_shop_stock(product_id: int, authorization: str | None = Header(None)):
+    """How much of this SAME product the branch already has on hand in
+    THEIR OWN shop — i.e. LAROUCHE's own stock at their specific outlet
+    (warehouse), not SWAG's supplier-side stock. Matched by product code
+    (default_code) between the two separate Odoo systems."""
+    payload = read_token(authorization)
+
+    recs = swag_execute("product.product", "read", [[product_id]], {"fields": ["default_code", "name"]})
+    code = recs[0].get("default_code") if recs else None
+    if not code:
+        return {"matched": False, "quantity": None, "reason": "This product has no code to match by."}
+
+    laroche_products = laroche_admin_execute(
+        "product.product", "search_read", [[["default_code", "=", code]]], {"fields": ["id", "name"]}
+    )
+    if len(laroche_products) != 1:
+        reason = "not found in LAROUCHE" if not laroche_products else "multiple LAROUCHE products share this code"
+        return {"matched": False, "quantity": None, "reason": reason}
+    laroche_product_id = laroche_products[0]["id"]
+
+    warehouse_id = int(payload["branch_key"])
+    quants = laroche_admin_execute(
+        "stock.quant", "search_read",
+        [[["product_id", "=", laroche_product_id], ["location_id.usage", "=", "internal"], ["quantity", "!=", 0]]],
+        {"fields": ["location_id", "quantity"]},
+    )
+    if not quants:
+        return {"matched": True, "quantity": 0, "laroche_product_name": laroche_products[0]["name"]}
+
+    location_ids = list({q["location_id"][0] for q in quants if q.get("location_id")})
+    locations = laroche_admin_execute("stock.location", "read", [location_ids], {"fields": ["warehouse_id"]})
+    loc_to_wh_id = {loc["id"]: (loc["warehouse_id"][0] if loc.get("warehouse_id") else None) for loc in locations}
+
+    total = 0.0
+    for q in quants:
+        loc = q.get("location_id")
+        if not loc:
+            continue
+        if loc_to_wh_id.get(loc[0]) == warehouse_id:
+            total += q["quantity"]
+
+    return {"matched": True, "quantity": total, "laroche_product_name": laroche_products[0]["name"]}
 
 
 @app.get("/api/swag-warehouses")
