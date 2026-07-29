@@ -67,6 +67,7 @@ SWAG_API_KEY = os.environ.get("SWAG_API_KEY", "")
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-railway-variables")
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 MAP_FILE = Path(__file__).parent / "branch_partner_map.json"
 
@@ -272,22 +273,37 @@ def auto_resolve_swag_partner(branch_info: dict):
 
     Returns (partner_id, partner_name, matched_on, candidates).
     """
-    steps = []
+    # Build ONE combined OR query across every identifier we have, instead of
+    # up to 5 separate round-trips to Odoo — this is what made branch
+    # selection feel slow. We still evaluate priority (vat > email > mobile
+    # > phone > name) afterwards, just against data already fetched.
+    identifiers = []
     if branch_info.get("vat"):
-        steps.append(("vat", [["vat", "=", branch_info["vat"]]]))
+        identifiers.append(("vat", branch_info["vat"]))
     if branch_info.get("email"):
-        steps.append(("email", [["email", "=", branch_info["email"]]]))
+        identifiers.append(("email", branch_info["email"]))
     if branch_info.get("mobile"):
-        steps.append(("mobile", [["mobile", "=", branch_info["mobile"]]]))
+        identifiers.append(("mobile", branch_info["mobile"]))
     if branch_info.get("phone"):
-        steps.append(("phone", [["phone", "=", branch_info["phone"]]]))
+        identifiers.append(("phone", branch_info["phone"]))
     if branch_info.get("name"):
-        steps.append(("name (exact)", [["name", "=", branch_info["name"]]]))
+        identifiers.append(("name", branch_info["name"]))
+
+    if not identifiers:
+        return None, None, None, []
+
+    or_terms = [[field, "=", value] for field, value in identifiers]
+    # Odoo polish-notation OR domain: ["|", "|", term1, term2, term3, ...]
+    combined_domain = (["|"] * (len(or_terms) - 1)) + or_terms
+
+    all_matches = swag_execute(
+        "res.partner", "search_read", [combined_domain],
+        {"fields": ["id", "name", "city", "street", "email", "phone", "mobile", "vat"]},
+    )
 
     best_candidates: list[dict] = []
-    for label, domain in steps:
-        matches = swag_execute("res.partner", "search_read", [domain],
-                                {"fields": ["id", "name", "city", "street", "email", "phone"]})
+    for label, value in identifiers:
+        matches = [m for m in all_matches if m.get(label) == value]
         if len(matches) == 1:
             return matches[0]["id"], matches[0]["name"], label, []
         if len(matches) > 1:
@@ -393,9 +409,36 @@ def read_token(authorization: str | None) -> dict:
     return payload
 
 
+def make_admin_token() -> str:
+    payload = {
+        "type": "admin",
+        "exp": datetime.now(timezone.utc) + timedelta(hours=12),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def read_admin_token(authorization: str | None) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing or invalid Authorization header.")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Admin session expired, please log in again.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid admin session token.")
+    if payload.get("type") != "admin":
+        raise HTTPException(401, "Invalid admin session token.")
+    return payload
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHEMAS
 # ─────────────────────────────────────────────────────────────────────────────
+class AdminLoginRequest(BaseModel):
+    password: str
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -608,6 +651,22 @@ def me(authorization: str | None = Header(None)):
     }
 
 
+@app.post("/api/report-wrong-customer")
+def report_wrong_customer(authorization: str | None = Header(None)):
+    """Self-service correction: if a branch employee notices this session is
+    linked to the wrong SWAG customer, this clears the saved mapping for
+    their outlet so the NEXT login re-runs matching (and asks a human to
+    confirm if it's ambiguous) instead of reusing the wrong cached result."""
+    payload = read_token(authorization)
+    key = payload["branch_key"]
+    mapping = load_branch_partner_map()
+    if key in mapping:
+        del mapping[key]
+        save_branch_partner_map(mapping)
+    _resolved_cache.pop(key, None)
+    return {"ok": True, "message": "Mapping cleared — please log out and log back in to re-verify."}
+
+
 @app.get("/api/products")
 def search_products(q: str = "", limit: int = 40, authorization: str | None = Header(None)):
     read_token(authorization)
@@ -679,30 +738,32 @@ def list_swag_warehouses(authorization: str | None = Header(None)):
     return {"warehouses": warehouses}
 
 
-@app.post("/api/orders")
-def create_order(body: OrderRequest, authorization: str | None = Header(None)):
-    payload = read_token(authorization)
-    if not body.items:
-        raise HTTPException(400, "Cart is empty.")
-
+def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name, branch_name, branch_key):
+    """Core order-creation logic — shared by the direct 'Submit' path and the
+    manager-approval path (once a pending order is approved)."""
     order_lines = [
-        (0, 0, {"product_id": item.product_id, "product_uom_qty": item.qty})
-        for item in body.items
+        (0, 0, {"product_id": item["product_id"], "product_uom_qty": item["qty"]})
+        for item in items
     ]
-    employee_name = payload.get("employee_name") or "unknown"
-    note_lines = [f"Ordered via Branch Portal by {employee_name} ({payload.get('branch_name')})"]
-    if body.note:
-        note_lines.append(body.note)
+    note_lines = [f"Ordered via Branch Portal by {employee_name} ({branch_name})"]
+    if note:
+        note_lines.append(note)
 
     vals = {
-        "partner_id": payload["swag_partner_id"],
+        "partner_id": swag_partner_id,
         "order_line": order_lines,
         "note": "\n".join(note_lines),
     }
-    if body.warehouse_id:
-        vals["warehouse_id"] = body.warehouse_id
+    if warehouse_id:
+        vals["warehouse_id"] = warehouse_id
 
     order_id = swag_execute("sale.order", "create", [vals], {})
+
+    # Odoo's warehouse_id is a computed field (defaults from the partner/
+    # company) that can silently override whatever we pass at create() time.
+    # Writing it again right after forces our explicit choice to stick.
+    if warehouse_id:
+        swag_execute("sale.order", "write", [[order_id], {"warehouse_id": warehouse_id}])
 
     detail_fields = [
         "name", "partner_id", "partner_invoice_id", "partner_shipping_id",
@@ -737,19 +798,176 @@ def create_order(body: OrderRequest, authorization: str | None = Header(None)):
     database.log_order(
         swag_order_id=order_id,
         swag_order_name=details["order_name"] or str(order_id),
-        branch_key=payload["branch_key"],
-        branch_name=payload.get("branch_name"),
+        branch_key=branch_key,
+        branch_name=branch_name,
         employee_name=employee_name,
-        swag_partner_id=payload["swag_partner_id"],
-        swag_partner_name=payload.get("swag_partner_name"),
-        warehouse_id=body.warehouse_id,
+        swag_partner_id=swag_partner_id,
+        swag_partner_name=details["customer"],
+        warehouse_id=warehouse_id,
         warehouse_name=details.get("warehouse"),
-        item_count=len(body.items),
+        item_count=len(items),
         amount_total=order.get("amount_total") or 0,
-        items_json=json.dumps([{"product_id": it.product_id, "qty": it.qty} for it in body.items]),
+        items_json=json.dumps(items),
     )
 
+    return order_id, details
+
+
+@app.post("/api/orders")
+def create_order(body: OrderRequest, authorization: str | None = Header(None)):
+    payload = read_token(authorization)
+    if not body.items:
+        raise HTTPException(400, "Cart is empty.")
+
+    employee_name = payload.get("employee_name") or "unknown"
+    items = [{"product_id": it.product_id, "qty": it.qty} for it in body.items]
+    order_id, details = _create_swag_order(
+        payload["swag_partner_id"], items, body.warehouse_id, body.note,
+        employee_name, payload.get("branch_name"), payload["branch_key"],
+    )
     return {"order_id": order_id, "order_name": details["order_name"] or str(order_id), "details": details}
+
+
+class PendingOrderRequest(BaseModel):
+    items: list[CartItem]
+    warehouse_id: int | None = None
+    note: str | None = None
+
+
+class DecidePendingRequest(BaseModel):
+    reason: str | None = None
+
+
+@app.post("/api/orders/pending")
+def submit_pending_order(body: PendingOrderRequest, authorization: str | None = Header(None)):
+    """Save an order for manager approval — does NOT touch SWAG yet."""
+    payload = read_token(authorization)
+    if not body.items:
+        raise HTTPException(400, "Cart is empty.")
+
+    # Look up names/prices for a readable summary later.
+    items_with_names = []
+    for it in body.items:
+        recs = swag_execute("product.product", "read", [[it.product_id]],
+                             {"fields": ["default_code", "name", "list_price"]})
+        rec = recs[0] if recs else {}
+        items_with_names.append({
+            "product_id": it.product_id,
+            "default_code": rec.get("default_code"),
+            "name": rec.get("name"),
+            "qty": it.qty,
+            "price": rec.get("list_price") or 0,
+        })
+    amount_total = sum(i["qty"] * i["price"] for i in items_with_names)
+
+    db = database.get_session()
+    try:
+        row = database.PendingOrder(
+            branch_key=payload["branch_key"],
+            branch_name=payload.get("branch_name"),
+            swag_partner_id=payload["swag_partner_id"],
+            requested_by=payload.get("employee_name") or "unknown",
+            warehouse_id=body.warehouse_id,
+            note=body.note,
+            items_json=json.dumps(items_with_names),
+            amount_total=amount_total,
+            status="pending",
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {"id": row.id, "status": "pending"}
+    finally:
+        db.close()
+
+
+@app.get("/api/orders/pending")
+def list_pending_orders(authorization: str | None = Header(None)):
+    """Every pending/approved/rejected order for this branch — the approval queue."""
+    payload = read_token(authorization)
+    db = database.get_session()
+    try:
+        rows = (
+            db.query(database.PendingOrder)
+            .filter(database.PendingOrder.branch_key == payload["branch_key"])
+            .order_by(database.PendingOrder.created_at.desc())
+            .all()
+        )
+        return {
+            "pending_orders": [
+                {
+                    "id": r.id,
+                    "requested_by": r.requested_by,
+                    "items": json.loads(r.items_json),
+                    "amount_total": r.amount_total,
+                    "warehouse_id": r.warehouse_id,
+                    "note": r.note,
+                    "status": r.status,
+                    "decided_by": r.decided_by,
+                    "swag_order_name": r.swag_order_name,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in rows
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/orders/pending/{pending_id}/approve")
+def approve_pending_order(pending_id: int, body: DecidePendingRequest, authorization: str | None = Header(None)):
+    """Approve a pending order — THIS is when it actually gets created in SWAG."""
+    payload = read_token(authorization)
+    db = database.get_session()
+    try:
+        row = db.query(database.PendingOrder).filter(database.PendingOrder.id == pending_id).first()
+        if not row:
+            raise HTTPException(404, "Pending order not found.")
+        if row.branch_key != payload["branch_key"]:
+            raise HTTPException(403, "This pending order doesn't belong to your outlet.")
+        if row.status != "pending":
+            raise HTTPException(400, f"This order was already {row.status}.")
+
+        items = json.loads(row.items_json)
+        order_items = [{"product_id": i["product_id"], "qty": i["qty"]} for i in items]
+        order_id, details = _create_swag_order(
+            row.swag_partner_id, order_items, row.warehouse_id, row.note,
+            row.requested_by, row.branch_name, row.branch_key,
+        )
+
+        row.status = "approved"
+        row.decided_by = payload.get("employee_name") or "unknown"
+        row.decided_at = datetime.now(timezone.utc)
+        row.swag_order_id = order_id
+        row.swag_order_name = details["order_name"]
+        db.commit()
+
+        return {"order_id": order_id, "order_name": details["order_name"], "details": details}
+    finally:
+        db.close()
+
+
+@app.post("/api/orders/pending/{pending_id}/reject")
+def reject_pending_order(pending_id: int, body: DecidePendingRequest, authorization: str | None = Header(None)):
+    payload = read_token(authorization)
+    db = database.get_session()
+    try:
+        row = db.query(database.PendingOrder).filter(database.PendingOrder.id == pending_id).first()
+        if not row:
+            raise HTTPException(404, "Pending order not found.")
+        if row.branch_key != payload["branch_key"]:
+            raise HTTPException(403, "This pending order doesn't belong to your outlet.")
+        if row.status != "pending":
+            raise HTTPException(400, f"This order was already {row.status}.")
+
+        row.status = "rejected"
+        row.decided_by = payload.get("employee_name") or "unknown"
+        row.decided_at = datetime.now(timezone.utc)
+        row.note = (row.note or "") + (f"\nRejected: {body.reason}" if body.reason else "")
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
 
 
 class BulkLookupRequest(BaseModel):
@@ -777,6 +995,25 @@ def bulk_lookup_products(body: BulkLookupRequest, authorization: str | None = He
         else:
             not_found.append(code)
     return {"matched": matched, "not_found": not_found}
+
+
+@app.get("/api/products/by-barcode")
+def product_by_barcode(code: str, authorization: str | None = Header(None)):
+    """Used by the barcode scanner — look up a product by its exact barcode."""
+    read_token(authorization)
+    code = (code or "").strip()
+    if not code:
+        raise HTTPException(400, "No barcode provided.")
+    recs = swag_execute(
+        "product.product", "search_read",
+        [[["barcode", "=", code]]],
+        {"fields": ["id", "default_code", "name", "list_price", "qty_available"]},
+    )
+    if not recs:
+        raise HTTPException(404, f"No product found with barcode {code}.")
+    if len(recs) > 1:
+        raise HTTPException(409, f"Multiple products share barcode {code} — search by name/code instead.")
+    return {"product": recs[0]}
 
 
 @app.get("/api/my-orders")
@@ -898,3 +1135,168 @@ def order_graph(days: int = 30, authorization: str | None = Header(None)):
         return {"series": series[-days:] if days else series}
     finally:
         db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN DASHBOARD — separate login (shared password), combined view across
+# every branch. Reads only from our own tracking database, never touches
+# Odoo directly, so it stays fast regardless of how many branches exist.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/api/admin/login")
+def admin_login(body: AdminLoginRequest):
+    if not ADMIN_PASSWORD:
+        raise HTTPException(500, "Server is missing ADMIN_PASSWORD configuration.")
+    if body.password != ADMIN_PASSWORD:
+        raise HTTPException(401, "Incorrect admin password.")
+    return {"token": make_admin_token()}
+
+
+@app.get("/api/admin/summary")
+def admin_summary(authorization: str | None = Header(None)):
+    read_admin_token(authorization)
+    db = database.get_session()
+    try:
+        orders = db.query(database.OrderRecord).all()
+        branches = {o.branch_key for o in orders}
+        total_value = sum(o.amount_total or 0 for o in orders)
+        return {
+            "total_orders": len(orders),
+            "total_value": total_value,
+            "branch_count": len(branches),
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/admin/branches")
+def admin_branches(authorization: str | None = Header(None)):
+    """Every branch that has placed at least one order, with its own totals
+    — powers the comparison table/chart."""
+    read_admin_token(authorization)
+    db = database.get_session()
+    try:
+        orders = db.query(database.OrderRecord).all()
+        by_branch: dict[str, dict] = {}
+        for o in orders:
+            b = by_branch.setdefault(o.branch_key, {
+                "branch_key": o.branch_key,
+                "branch_name": o.branch_name,
+                "order_count": 0,
+                "total_value": 0.0,
+                "last_order_at": None,
+            })
+            b["order_count"] += 1
+            b["total_value"] += o.amount_total or 0
+            if not b["last_order_at"] or o.created_at > b["last_order_at"]:
+                b["last_order_at"] = o.created_at
+
+        result = sorted(by_branch.values(), key=lambda b: b["total_value"], reverse=True)
+        for b in result:
+            b["last_order_at"] = b["last_order_at"].isoformat() if b["last_order_at"] else None
+        return {"branches": result}
+    finally:
+        db.close()
+
+
+@app.get("/api/admin/graph")
+def admin_graph(days: int = 30, authorization: str | None = Header(None)):
+    """Daily order count + value across ALL branches combined — the overall
+    trend line for the admin dashboard."""
+    read_admin_token(authorization)
+    db = database.get_session()
+    try:
+        rows = db.query(database.OrderRecord).order_by(database.OrderRecord.created_at.asc()).all()
+        by_day: dict[str, dict] = {}
+        for r in rows:
+            day = r.created_at.strftime("%Y-%m-%d")
+            bucket = by_day.setdefault(day, {"date": day, "orders": 0, "total": 0.0})
+            bucket["orders"] += 1
+            bucket["total"] += r.amount_total or 0
+        series = sorted(by_day.values(), key=lambda b: b["date"])
+        return {"series": series[-days:] if days else series}
+    finally:
+        db.close()
+
+
+@app.get("/api/admin/orders")
+def admin_orders(limit: int = 100, authorization: str | None = Header(None)):
+    """Every order placed through the portal, across all branches — the
+    full raw list behind the summary/comparison views."""
+    read_admin_token(authorization)
+    db = database.get_session()
+    try:
+        rows = (
+            db.query(database.OrderRecord)
+            .order_by(database.OrderRecord.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return {
+            "orders": [
+                {
+                    "id": r.id,
+                    "swag_order_name": r.swag_order_name,
+                    "branch_name": r.branch_name,
+                    "employee_name": r.employee_name,
+                    "warehouse_name": r.warehouse_name,
+                    "item_count": r.item_count,
+                    "amount_total": r.amount_total,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in rows
+            ]
+        }
+    finally:
+        db.close()
+
+
+class ClearMappingRequest(BaseModel):
+    branch_key: str
+
+
+@app.get("/api/admin/mappings")
+def admin_mappings(authorization: str | None = Header(None)):
+    """Every branch -> SWAG customer mapping currently in effect, with the
+    best-known branch name (from login/order history) and the live SWAG
+    customer name — lets an admin spot and fix a wrong match immediately."""
+    read_admin_token(authorization)
+    mapping = load_branch_partner_map()
+
+    db = database.get_session()
+    try:
+        name_by_key: dict[str, str] = {}
+        for row in db.query(database.LoginEvent).order_by(database.LoginEvent.created_at.desc()).all():
+            name_by_key.setdefault(row.branch_key, row.branch_name)
+    finally:
+        db.close()
+
+    result = []
+    for branch_key, swag_partner_id in mapping.items():
+        swag_name = None
+        try:
+            recs = swag_execute("res.partner", "read", [[swag_partner_id]], {"fields": ["name"]})
+            swag_name = recs[0]["name"] if recs else None
+        except Exception:
+            pass
+        result.append({
+            "branch_key": branch_key,
+            "branch_name": name_by_key.get(branch_key, "(unknown — no login recorded yet)"),
+            "swag_partner_id": swag_partner_id,
+            "swag_partner_name": swag_name or "(SWAG partner not found — may have been deleted)",
+        })
+    result.sort(key=lambda r: r["branch_name"])
+    return {"mappings": result}
+
+
+@app.post("/api/admin/mappings/clear")
+def admin_clear_mapping(body: ClearMappingRequest, authorization: str | None = Header(None)):
+    """Admin-triggered version of the branch's own 'report wrong customer' —
+    clears one branch's saved mapping so its next login re-verifies from
+    scratch."""
+    read_admin_token(authorization)
+    mapping = load_branch_partner_map()
+    if body.branch_key in mapping:
+        del mapping[body.branch_key]
+        save_branch_partner_map(mapping)
+    _resolved_cache.pop(body.branch_key, None)
+    return {"ok": True}

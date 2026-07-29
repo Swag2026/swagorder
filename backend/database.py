@@ -21,12 +21,11 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./branch_portal.db")
 
-# SQLAlchemy 2.x needs postgresql:// (Heroku/Railway sometimes give postgres://)
+# Railway/Heroku-style Postgres URLs sometimes start with postgres:// —
+# SQLAlchemy 2.x needs postgresql://
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
-elif DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
-            
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -62,6 +61,30 @@ class OrderRecord(Base):
     amount_total = Column(Float)
     items_json = Column(Text)  # JSON list of {product_id, name, qty, price}
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class PendingOrder(Base):
+    """An order a staff member submitted for manager approval — sits here
+    until someone at the branch approves (creating the real SWAG order) or
+    rejects it. Nothing touches Odoo until approved."""
+    __tablename__ = "pending_orders"
+
+    id = Column(Integer, primary_key=True)
+    branch_key = Column(String, index=True)
+    branch_name = Column(String)
+    swag_partner_id = Column(Integer)
+    requested_by = Column(String)          # employee who submitted it
+    warehouse_id = Column(Integer, nullable=True)
+    warehouse_name = Column(String, nullable=True)
+    note = Column(Text, nullable=True)
+    items_json = Column(Text)              # JSON list of {product_id, name, default_code, qty, price}
+    amount_total = Column(Float)
+    status = Column(String, default="pending")  # pending | approved | rejected
+    decided_by = Column(String, nullable=True)
+    swag_order_id = Column(Integer, nullable=True)
+    swag_order_name = Column(String, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    decided_at = Column(DateTime, nullable=True)
 
 
 Base.metadata.create_all(engine)
