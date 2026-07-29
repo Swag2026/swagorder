@@ -839,6 +839,19 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
 
     order_id = swag_execute("sale.order", "create", [vals], {})
 
+    # Odoo defaults the new order's salesperson (user_id) to whichever
+    # account is making the API call (our shared service account) rather
+    # than the customer's own pre-assigned salesperson. If this customer has
+    # one configured, force it onto the order — same pattern as the
+    # warehouse_id fix below.
+    try:
+        partner_recs = swag_execute("res.partner", "read", [[swag_partner_id]], {"fields": ["user_id"]})
+        partner_salesperson = partner_recs[0].get("user_id") if partner_recs else False
+        if partner_salesperson:
+            swag_execute("sale.order", "write", [[order_id], {"user_id": partner_salesperson[0]}])
+    except Exception:
+        pass  # non-critical — order still gets created either way
+
     # Odoo's warehouse_id is a computed field (defaults from the partner/
     # company) that can silently override whatever we pass at create() time.
     # Writing it again right after forces our explicit choice to stick.
