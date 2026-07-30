@@ -465,6 +465,8 @@ class ConfirmBranchRequest(BaseModel):
 class CartItem(BaseModel):
     product_id: int
     qty: float
+    packaging_id: int | None = None
+    packaging_qty: float | None = None  # number of boxes/packages, if ordering by packaging
 
 
 class OrderRequest(BaseModel):
@@ -824,6 +826,20 @@ def product_stock_by_warehouse(product_id: int, authorization: str | None = Head
     return {"stock_by_warehouse": result}
 
 
+@app.get("/api/products/{product_id}/packagings")
+def product_packagings(product_id: int, authorization: str | None = Header(None)):
+    """SWAG's own packaging options for this product (e.g. 'P48' = box of 48
+    pieces) — matches how orders are actually placed manually in SWAG (by
+    box/dozen, not loose units)."""
+    read_token(authorization)
+    recs = swag_execute(
+        "product.packaging", "search_read",
+        [[["product_id", "=", product_id]]],
+        {"fields": ["id", "name", "qty"], "order": "qty asc"},
+    )
+    return {"packagings": recs}
+
+
 @app.get("/api/products/{product_id}/my-shop-stock")
 def product_my_shop_stock(product_id: int, authorization: str | None = Header(None)):
     """How much of this SAME product the branch already has on hand in
@@ -883,10 +899,14 @@ def list_swag_warehouses(authorization: str | None = Header(None)):
 def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name, branch_name, branch_key):
     """Core order-creation logic — shared by the direct 'Submit' path and the
     manager-approval path (once a pending order is approved)."""
-    order_lines = [
-        (0, 0, {"product_id": item["product_id"], "product_uom_qty": item["qty"]})
-        for item in items
-    ]
+    order_lines = []
+    for item in items:
+        line_vals = {"product_id": item["product_id"], "product_uom_qty": item["qty"]}
+        if item.get("packaging_id"):
+            line_vals["product_packaging_id"] = item["packaging_id"]
+            if item.get("packaging_qty") is not None:
+                line_vals["product_packaging_qty"] = item["packaging_qty"]
+        order_lines.append((0, 0, line_vals))
     note_lines = [f"Ordered via Branch Portal by {employee_name} ({branch_name})"]
     if note:
         note_lines.append(note)
@@ -975,7 +995,10 @@ def create_order(body: OrderRequest, authorization: str | None = Header(None)):
         raise HTTPException(400, "Cart is empty.")
 
     employee_name = payload.get("employee_name") or "unknown"
-    items = [{"product_id": it.product_id, "qty": it.qty} for it in body.items]
+    items = [
+        {"product_id": it.product_id, "qty": it.qty, "packaging_id": it.packaging_id, "packaging_qty": it.packaging_qty}
+        for it in body.items
+    ]
     order_id, details = _create_swag_order(
         payload["swag_partner_id"], items, body.warehouse_id, body.note,
         employee_name, payload.get("branch_name"), payload["branch_key"],
@@ -1012,6 +1035,8 @@ def submit_pending_order(body: PendingOrderRequest, authorization: str | None = 
             "name": rec.get("name"),
             "qty": it.qty,
             "price": rec.get("list_price") or 0,
+            "packaging_id": it.packaging_id,
+            "packaging_qty": it.packaging_qty,
         })
     amount_total = sum(i["qty"] * i["price"] for i in items_with_names)
 
@@ -1084,7 +1109,15 @@ def approve_pending_order(pending_id: int, body: DecidePendingRequest, authoriza
             raise HTTPException(400, f"This order was already {row.status}.")
 
         items = json.loads(row.items_json)
-        order_items = [{"product_id": i["product_id"], "qty": i["qty"]} for i in items]
+        order_items = [
+            {
+                "product_id": i["product_id"],
+                "qty": i["qty"],
+                "packaging_id": i.get("packaging_id"),
+                "packaging_qty": i.get("packaging_qty"),
+            }
+            for i in items
+        ]
         order_id, details = _create_swag_order(
             row.swag_partner_id, order_items, row.warehouse_id, row.note,
             row.requested_by, row.branch_name, row.branch_key,
