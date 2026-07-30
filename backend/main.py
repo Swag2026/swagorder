@@ -828,35 +828,31 @@ def product_stock_by_warehouse(product_id: int, authorization: str | None = Head
 
 @app.get("/api/products/{product_id}/packagings")
 def product_packagings(product_id: int, authorization: str | None = Header(None)):
-    """SWAG's own packaging options for this product (e.g. 'P48' = box of 48
-    pieces) — matches how orders are actually placed manually in SWAG (by
-    box/dozen, not loose units). Packagings are sometimes configured against
-    a sibling variant of the same product template (and shared via 'Sync to
-    Variants') rather than this exact variant id, so we also check there."""
+    """SWAG's own 'Packagings' — in this instance these are actually
+    alternate Units of Measure (the `uom_ids` field on the product, labeled
+    'Packagings' in the UI), e.g. a 'P48' unit worth 48 base units. Returns
+    each alternate unit's id/name/pieces-per-unit, excluding the product's
+    own base unit (ordering "1 unit" isn't offered when packagings exist)."""
     read_token(authorization)
 
-    domain = [["product_id", "=", product_id]]
-    recs = swag_execute("product.packaging", "search_read", [domain],
-                         {"fields": ["id", "name", "qty"], "order": "qty asc"})
+    prod = swag_execute("product.product", "read", [[product_id]], {"fields": ["uom_id", "uom_ids"]})
+    if not prod:
+        return {"packagings": []}
 
-    if not recs:
-        try:
-            prod = swag_execute("product.product", "read", [[product_id]], {"fields": ["product_tmpl_id"]})
-            tmpl = prod[0].get("product_tmpl_id") if prod else False
-            if tmpl:
-                sibling_ids = swag_execute(
-                    "product.product", "search", [[["product_tmpl_id", "=", tmpl[0]]]]
-                )
-                if sibling_ids:
-                    recs = swag_execute(
-                        "product.packaging", "search_read",
-                        [[["product_id", "in", sibling_ids]]],
-                        {"fields": ["id", "name", "qty"], "order": "qty asc"},
-                    )
-        except Exception:
-            pass  # fall through with whatever we found (possibly empty)
+    base_uom = prod[0].get("uom_id") or False
+    base_uom_id = base_uom[0] if base_uom else None
+    alt_uom_ids = prod[0].get("uom_ids") or []
+    alt_uom_ids = [uid for uid in alt_uom_ids if uid != base_uom_id]
+    if not alt_uom_ids:
+        return {"packagings": []}
 
-    return {"packagings": recs}
+    uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor_inv"]})
+    packagings = [
+        {"id": u["id"], "name": u["name"], "qty": u["factor_inv"]}
+        for u in uoms
+    ]
+    packagings.sort(key=lambda p: p["qty"])
+    return {"packagings": packagings}
 
 
 @app.get("/api/products/{product_id}/my-shop-stock")
@@ -920,11 +916,19 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
     manager-approval path (once a pending order is approved)."""
     order_lines = []
     for item in items:
-        line_vals = {"product_id": item["product_id"], "product_uom_qty": item["qty"]}
         if item.get("packaging_id"):
-            line_vals["product_packaging_id"] = item["packaging_id"]
-            if item.get("packaging_qty") is not None:
-                line_vals["product_packaging_qty"] = item["packaging_qty"]
+            # "packaging_id" here is actually a uom.uom id (an alternate unit
+            # like "P48" = 48 pieces) and "packaging_qty" is the number of
+            # those units (boxes) — Odoo interprets product_uom_qty in terms
+            # of whichever product_uom is set, and handles the pieces
+            # conversion itself.
+            line_vals = {
+                "product_id": item["product_id"],
+                "product_uom": item["packaging_id"],
+                "product_uom_qty": item.get("packaging_qty") or 1,
+            }
+        else:
+            line_vals = {"product_id": item["product_id"], "product_uom_qty": item["qty"]}
         order_lines.append((0, 0, line_vals))
     note_lines = [f"Ordered via Branch Portal by {employee_name} ({branch_name})"]
     if note:
