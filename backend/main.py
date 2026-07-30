@@ -830,13 +830,32 @@ def product_stock_by_warehouse(product_id: int, authorization: str | None = Head
 def product_packagings(product_id: int, authorization: str | None = Header(None)):
     """SWAG's own packaging options for this product (e.g. 'P48' = box of 48
     pieces) — matches how orders are actually placed manually in SWAG (by
-    box/dozen, not loose units)."""
+    box/dozen, not loose units). Packagings are sometimes configured against
+    a sibling variant of the same product template (and shared via 'Sync to
+    Variants') rather than this exact variant id, so we also check there."""
     read_token(authorization)
-    recs = swag_execute(
-        "product.packaging", "search_read",
-        [[["product_id", "=", product_id]]],
-        {"fields": ["id", "name", "qty"], "order": "qty asc"},
-    )
+
+    domain = [["product_id", "=", product_id]]
+    recs = swag_execute("product.packaging", "search_read", [domain],
+                         {"fields": ["id", "name", "qty"], "order": "qty asc"})
+
+    if not recs:
+        try:
+            prod = swag_execute("product.product", "read", [[product_id]], {"fields": ["product_tmpl_id"]})
+            tmpl = prod[0].get("product_tmpl_id") if prod else False
+            if tmpl:
+                sibling_ids = swag_execute(
+                    "product.product", "search", [[["product_tmpl_id", "=", tmpl[0]]]]
+                )
+                if sibling_ids:
+                    recs = swag_execute(
+                        "product.packaging", "search_read",
+                        [[["product_id", "in", sibling_ids]]],
+                        {"fields": ["id", "name", "qty"], "order": "qty asc"},
+                    )
+        except Exception:
+            pass  # fall through with whatever we found (possibly empty)
+
     return {"packagings": recs}
 
 
