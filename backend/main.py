@@ -870,6 +870,84 @@ def product_stock_by_warehouse(product_id: int, authorization: str | None = Head
     return result
 
 
+@app.get("/api/debug/packaging/{product_id}")
+def debug_packaging(product_id: int, authorization: str | None = Header(None)):
+    """Debug endpoint — shows raw Odoo data for packaging diagnosis.
+    Returns product.product fields, product.template id, and raw product.packaging records.
+    Remove this endpoint after diagnosis is complete.
+    """
+    read_token(authorization)
+
+    # Step 1: product.product fields
+    try:
+        prod_recs = swag_execute(
+            "product.product", "read", [[product_id]],
+            {"fields": ["id", "name", "default_code", "product_tmpl_id", "uom_id", "uom_ids"]}
+        )
+    except Exception as e:
+        return {"error": f"product.product read failed: {e}"}
+
+    if not prod_recs:
+        return {"error": "product not found"}
+
+    prod = prod_recs[0]
+    tmpl_id = prod.get("product_tmpl_id", [None])[0] if prod.get("product_tmpl_id") else None
+
+    # Step 2: product.packaging fields_get
+    try:
+        pkg_fields_meta = swag_execute(
+            "product.packaging", "fields_get", [],
+            {"attributes": ["string", "type", "relation"]}
+        )
+        pkg_field_names = list(pkg_fields_meta.keys()) if pkg_fields_meta else []
+    except Exception as e:
+        pkg_fields_meta = {}
+        pkg_field_names = [f"ERROR: {e}"]
+
+    # Step 3: search product.packaging with no filter — raw dump
+    try:
+        all_pkgs = swag_execute(
+            "product.packaging", "search_read",
+            [[]],
+            {"fields": ["id", "name", "qty", "product_id"], "limit": 50}
+        )
+    except Exception as e:
+        all_pkgs = [f"ERROR: {e}"]
+
+    # Step 4: search filtered by tmpl_id
+    pkg_by_tmpl = []
+    if tmpl_id:
+        try:
+            pkg_by_tmpl = swag_execute(
+                "product.packaging", "search_read",
+                [[[("product_id", "=", tmpl_id)]]],
+                {"fields": ["id", "name", "qty", "product_id"]}
+            )
+        except Exception as e:
+            pkg_by_tmpl = [f"ERROR: {e}"]
+
+    # Step 5: search filtered by product_id (product.product)
+    pkg_by_prod = []
+    try:
+        pkg_by_prod = swag_execute(
+            "product.packaging", "search_read",
+            [[[("product_id", "=", product_id)]]],
+            {"fields": ["id", "name", "qty", "product_id"]}
+        )
+    except Exception as e:
+        pkg_by_prod = [f"ERROR: {e}"]
+
+    return {
+        "product": prod,
+        "tmpl_id": tmpl_id,
+        "packaging_field_names": pkg_field_names,
+        "all_packagings_raw": all_pkgs,
+        "packagings_filtered_by_tmpl_id": pkg_by_tmpl,
+        "packagings_filtered_by_product_product_id": pkg_by_prod,
+        "current_api_result": _fetch_product_packagings(product_id),
+    }
+
+
 @app.get("/api/products/{product_id}/packagings")
 def product_packagings(product_id: int, authorization: str | None = Header(None)):
     """Product.packaging records for a product.  Cached 30 min.
