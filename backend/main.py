@@ -870,84 +870,6 @@ def product_stock_by_warehouse(product_id: int, authorization: str | None = Head
     return result
 
 
-@app.get("/api/debug/packaging/{product_id}")
-def debug_packaging(product_id: int, authorization: str | None = Header(None)):
-    """Debug endpoint — shows raw Odoo data for packaging diagnosis.
-    Returns product.product fields, product.template id, and raw product.packaging records.
-    Remove this endpoint after diagnosis is complete.
-    """
-    read_token(authorization)
-
-    # Step 1: product.product fields
-    try:
-        prod_recs = swag_execute(
-            "product.product", "read", [[product_id]],
-            {"fields": ["id", "name", "default_code", "product_tmpl_id", "uom_id", "uom_ids"]}
-        )
-    except Exception as e:
-        return {"error": f"product.product read failed: {e}"}
-
-    if not prod_recs:
-        return {"error": "product not found"}
-
-    prod = prod_recs[0]
-    tmpl_id = prod.get("product_tmpl_id", [None])[0] if prod.get("product_tmpl_id") else None
-
-    # Step 2: product.packaging fields_get
-    try:
-        pkg_fields_meta = swag_execute(
-            "product.packaging", "fields_get", [],
-            {"attributes": ["string", "type", "relation"]}
-        )
-        pkg_field_names = list(pkg_fields_meta.keys()) if pkg_fields_meta else []
-    except Exception as e:
-        pkg_fields_meta = {}
-        pkg_field_names = [f"ERROR: {e}"]
-
-    # Step 3: search product.packaging with no filter — raw dump
-    try:
-        all_pkgs = swag_execute(
-            "product.packaging", "search_read",
-            [[]],
-            {"fields": ["id", "name", "qty", "product_id"], "limit": 50}
-        )
-    except Exception as e:
-        all_pkgs = [f"ERROR: {e}"]
-
-    # Step 4: search filtered by tmpl_id
-    pkg_by_tmpl = []
-    if tmpl_id:
-        try:
-            pkg_by_tmpl = swag_execute(
-                "product.packaging", "search_read",
-                [[[("product_id", "=", tmpl_id)]]],
-                {"fields": ["id", "name", "qty", "product_id"]}
-            )
-        except Exception as e:
-            pkg_by_tmpl = [f"ERROR: {e}"]
-
-    # Step 5: search filtered by product_id (product.product)
-    pkg_by_prod = []
-    try:
-        pkg_by_prod = swag_execute(
-            "product.packaging", "search_read",
-            [[[("product_id", "=", product_id)]]],
-            {"fields": ["id", "name", "qty", "product_id"]}
-        )
-    except Exception as e:
-        pkg_by_prod = [f"ERROR: {e}"]
-
-    return {
-        "product": prod,
-        "tmpl_id": tmpl_id,
-        "packaging_field_names": pkg_field_names,
-        "all_packagings_raw": all_pkgs,
-        "packagings_filtered_by_tmpl_id": pkg_by_tmpl,
-        "packagings_filtered_by_product_product_id": pkg_by_prod,
-        "current_api_result": _fetch_product_packagings(product_id),
-    }
-
-
 @app.get("/api/products/{product_id}/packagings")
 def product_packagings(product_id: int, authorization: str | None = Header(None)):
     """Product.packaging records for a product.  Cached 30 min.
@@ -976,14 +898,15 @@ def product_packagings(product_id: int, authorization: str | None = Header(None)
 def _fetch_product_packagings(product_id: int) -> list:
     """Read product.packaging records for the given product.product id.
 
-    Odoo stores packagings on product.template, but product.packaging
-    has a `product_id` field that points to product.template in most
-    versions.  We resolve the template id from the product.product record
-    and then search product.packaging by that template id.
+    Tries every known way Odoo stores packaging across versions:
+    1. product.packaging filtered by product_tmpl_id (template id) — Odoo 14+
+    2. product.packaging filtered by product_id (template id) — most versions
+    3. product.packaging filtered by product_id = product.product id directly
+    4. Full scan of all product.packaging + client-side filter — ultimate fallback
 
-    Falls back gracefully if the model or fields are unavailable.
+    Returns list of {id, name, qty} dicts sorted by qty ascending.
     """
-    # Step 1: Get product.template id from product.product
+    # Step 1: Get product.template id and product.product id
     try:
         prod_recs = swag_execute(
             "product.product", "read", [[product_id]],
@@ -998,30 +921,32 @@ def _fetch_product_packagings(product_id: int) -> list:
     tmpl = prod_recs[0].get("product_tmpl_id")
     tmpl_id = tmpl[0] if tmpl else None
 
-    # Step 2: Determine available fields on product.packaging dynamically
+    # Step 2: Check which fields exist on product.packaging
     try:
-        fields_meta = swag_execute("product.packaging", "fields_get", [], {"attributes": ["string", "type"]})
+        fields_meta = swag_execute(
+            "product.packaging", "fields_get", [],
+            {"attributes": ["string", "type", "relation"]}
+        )
     except Exception:
         return []
 
     if not fields_meta:
         return []
 
-    # Build the field list to request — always id+name+qty, plus barcode if present
     available = set(fields_meta.keys())
-    req_fields = [f for f in ["id", "name", "qty", "product_id", "barcode"] if f in available]
-    if "id" not in req_fields:
-        req_fields.insert(0, "id")
-    if "name" not in req_fields or "qty" not in req_fields:
-        # Model doesn't have expected fields — not a standard product.packaging
+    if "qty" not in available or "name" not in available:
         return []
 
-    # Step 3: Search product.packaging records.
-    # Try by product_tmpl_id first (Odoo 14+), fall back to product_id (template)
+    req_fields = [f for f in ["id", "name", "qty", "product_id"] if f in available]
+
+    # Check if product.packaging.product_id points to template or product.product
+    pkg_product_id_relation = (fields_meta.get("product_id") or {}).get("relation", "")
+    # pkg_product_id_relation will be "product.template" or "product.product"
+
     pkg_records = []
 
-    # Try filtering by product_id (which in product.packaging is the template)
-    if tmpl_id:
+    # --- Attempt A: filter by tmpl_id if relation is product.template ---
+    if tmpl_id and "product.template" in pkg_product_id_relation:
         try:
             pkg_records = swag_execute(
                 "product.packaging", "search_read",
@@ -1031,25 +956,45 @@ def _fetch_product_packagings(product_id: int) -> list:
         except Exception:
             pkg_records = []
 
-    # If nothing found via template, try direct search_read with no filter
-    # and match by product code (less precise but safe fallback)
+    # --- Attempt B: filter by product.product id directly ---
     if not pkg_records:
         try:
-            # Some Odoo versions store packaging on product.product directly
             pkg_records = swag_execute(
                 "product.packaging", "search_read",
-                [[]],
-                {"fields": req_fields, "limit": 500}
+                [[[("product_id", "=", product_id)]]],
+                {"fields": req_fields}
             )
-            # Filter client-side for this product's template
-            if tmpl_id:
-                pkg_records = [
-                    r for r in pkg_records
-                    if r.get("product_id") and (
-                        (isinstance(r["product_id"], list) and r["product_id"][0] == tmpl_id)
-                        or r["product_id"] == tmpl_id
-                    )
-                ]
+        except Exception:
+            pkg_records = []
+
+    # --- Attempt C: filter by tmpl_id (even if relation unknown) ---
+    if not pkg_records and tmpl_id:
+        try:
+            pkg_records = swag_execute(
+                "product.packaging", "search_read",
+                [[[("product_id", "=", tmpl_id)]]],
+                {"fields": req_fields}
+            )
+        except Exception:
+            pkg_records = []
+
+    # --- Attempt D: full scan + client-side filter ---
+    if not pkg_records:
+        try:
+            all_pkgs = swag_execute(
+                "product.packaging", "search_read",
+                [[]],
+                {"fields": req_fields, "limit": 1000}
+            )
+            # Match by product_id field — could be template or product.product id
+            match_ids = set(filter(None, [tmpl_id, product_id]))
+            for r in (all_pkgs or []):
+                pid = r.get("product_id")
+                if not pid:
+                    continue
+                pid_val = pid[0] if isinstance(pid, list) else pid
+                if pid_val in match_ids:
+                    pkg_records.append(r)
         except Exception:
             return []
 
@@ -1062,6 +1007,8 @@ def _fetch_product_packagings(product_id: int) -> list:
         try:
             qty = float(raw_qty) if raw_qty is not None else 1.0
         except (TypeError, ValueError):
+            qty = 1.0
+        if qty <= 0:
             qty = 1.0
         packagings.append({
             "id": r["id"],
