@@ -1174,8 +1174,50 @@ def list_swag_warehouses(authorization: str | None = Header(None)):
     return result
 
 
+def _detect_line_warehouse_field() -> str | None:
+    """Detect which field on sale.order.line holds the warehouse.
+
+    We try field NAMES and relations directly (not just labels) because
+    Odoo may be in Arabic and label-based matching fails.
+    Known field names across Odoo versions: warehouse_id (custom/community modules).
+    We check which ones actually exist via fields_get and return the first
+    many2one field whose relation is stock.warehouse.
+    Falls back to label search with Arabic keywords as last resort.
+    """
+    cache_key = "sale.order.line:warehouse_field"
+    if cache_key in _field_label_cache:
+        return _field_label_cache[cache_key]
+
+    try:
+        meta = swag_execute("sale.order.line", "fields_get", [], {"attributes": ["string", "relation", "type"]})
+    except Exception:
+        _field_label_cache[cache_key] = None
+        return None
+
+    if not meta:
+        _field_label_cache[cache_key] = None
+        return None
+
+    # Priority 1: any many2one field whose relation is stock.warehouse
+    for fname, finfo in meta.items():
+        if finfo.get("type") == "many2one" and finfo.get("relation") == "stock.warehouse":
+            _field_label_cache[cache_key] = fname
+            return fname
+
+    # Priority 2: label-based fallback with English AND Arabic keywords
+    warehouse_keywords = ["warehouse", "\u0645\u0633\u062a\u0648\u062f\u0639", "\u0645\u062e\u0632\u0646"]
+    for fname, finfo in meta.items():
+        label = (finfo.get("string") or "").lower()
+        if any(kw in label for kw in warehouse_keywords) and finfo.get("type") == "many2one":
+            _field_label_cache[cache_key] = fname
+            return fname
+
+    _field_label_cache[cache_key] = None
+    return None
+
+
 def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name, branch_name, branch_key):
-    line_warehouse_field = find_field_by_label("sale.order.line", ["warehouse"]) if warehouse_id else None
+    line_warehouse_field = _detect_line_warehouse_field() if warehouse_id else None
 
     order_lines = []
     for item in items:
