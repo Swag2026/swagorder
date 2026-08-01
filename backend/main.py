@@ -112,6 +112,11 @@ class _TTLCache:
             for k in keys:
                 del self._store[k]
 
+    def clear(self):
+        """Flush all entries (thread-safe). Use this instead of accessing _store directly."""
+        with self._lock:
+            self._store.clear()
+
 
 _cache = _TTLCache()
 
@@ -145,6 +150,7 @@ def save_branch_partner_map(mapping: dict) -> None:
 
 
 _resolved_cache: dict[str, int] = {}
+_resolved_cache_lock = Lock()  # FIX: dict is shared across threads; protect reads/writes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,6 +158,10 @@ _resolved_cache: dict[str, int] = {}
 # ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="SWAG Branch Order Portal API")
 
+# NOTE: Starlette applies middleware in LIFO order (last-added runs first).
+# GZipMiddleware is first here so it runs LAST (compresses the final response).
+# CORSMiddleware is second so it runs FIRST (adds headers before anything else).
+# Swapping these two would break CORS preflight — do NOT reorder.
 app.add_middleware(GZipMiddleware, minimum_size=500)   # compress JSON responses
 app.add_middleware(
     CORSMiddleware,
@@ -193,25 +203,27 @@ def laroche_execute_as(uid: int, password: str, model: str, method: str, args: l
         raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
 
 
+_laroche_admin_uid_lock = Lock()  # FIX: guard shared uid cache against race conditions
 _laroche_admin_uid_cache: int | None = None
 
 
 def laroche_admin_uid() -> int:
     global _laroche_admin_uid_cache
-    if _laroche_admin_uid_cache:
-        return _laroche_admin_uid_cache
-    if not (LAROUCHE_URL and LAROUCHE_DB and LAROUCHE_ADMIN_USER and LAROUCHE_ADMIN_API_KEY):
-        raise HTTPException(500, "Server is missing LAROUCHE_ADMIN_USER / LAROUCHE_ADMIN_API_KEY.")
-    try:
-        uid = _proxy(LAROUCHE_URL, "common").authenticate(
-            LAROUCHE_DB, LAROUCHE_ADMIN_USER, LAROUCHE_ADMIN_API_KEY, {}
-        )
-    except Exception as e:
-        raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
-    if not uid:
-        raise HTTPException(500, "LAROUCHE admin account credentials are invalid.")
-    _laroche_admin_uid_cache = uid
-    return uid
+    with _laroche_admin_uid_lock:
+        if _laroche_admin_uid_cache:
+            return _laroche_admin_uid_cache
+        if not (LAROUCHE_URL and LAROUCHE_DB and LAROUCHE_ADMIN_USER and LAROUCHE_ADMIN_API_KEY):
+            raise HTTPException(500, "Server is missing LAROUCHE_ADMIN_USER / LAROUCHE_ADMIN_API_KEY.")
+        try:
+            uid = _proxy(LAROUCHE_URL, "common").authenticate(
+                LAROUCHE_DB, LAROUCHE_ADMIN_USER, LAROUCHE_ADMIN_API_KEY, {}
+            )
+        except Exception as e:
+            raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
+        if not uid:
+            raise HTTPException(500, "LAROUCHE admin account credentials are invalid.")
+        _laroche_admin_uid_cache = uid
+        return uid
 
 
 def laroche_admin_execute(model: str, method: str, args: list, kwargs: dict | None = None):
@@ -225,23 +237,25 @@ def laroche_admin_execute(model: str, method: str, args: list, kwargs: dict | No
         raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
 
 
+_swag_uid_lock = Lock()  # FIX: guard shared uid cache against race conditions
 _swag_uid_cache: int | None = None
 
 
 def swag_uid() -> int:
     global _swag_uid_cache
-    if _swag_uid_cache:
-        return _swag_uid_cache
-    if not (SWAG_URL and SWAG_DB and SWAG_USER and SWAG_API_KEY):
-        raise HTTPException(500, "Server is missing SWAG_URL / SWAG_DB / SWAG_USER / SWAG_API_KEY.")
-    try:
-        uid = _proxy(SWAG_URL, "common").authenticate(SWAG_DB, SWAG_USER, SWAG_API_KEY, {})
-    except Exception as e:
-        raise HTTPException(502, f"Could not reach SWAG Odoo: {e}")
-    if not uid:
-        raise HTTPException(500, "SWAG service account credentials are invalid.")
-    _swag_uid_cache = uid
-    return uid
+    with _swag_uid_lock:
+        if _swag_uid_cache:
+            return _swag_uid_cache
+        if not (SWAG_URL and SWAG_DB and SWAG_USER and SWAG_API_KEY):
+            raise HTTPException(500, "Server is missing SWAG_URL / SWAG_DB / SWAG_USER / SWAG_API_KEY.")
+        try:
+            uid = _proxy(SWAG_URL, "common").authenticate(SWAG_DB, SWAG_USER, SWAG_API_KEY, {})
+        except Exception as e:
+            raise HTTPException(502, f"Could not reach SWAG Odoo: {e}")
+        if not uid:
+            raise HTTPException(500, "SWAG service account credentials are invalid.")
+        _swag_uid_cache = uid
+        return uid
 
 
 def swag_execute(model: str, method: str, args: list, kwargs: dict | None = None):
@@ -378,7 +392,10 @@ def run_parallel(**fns) -> dict:
         try:
             out[name] = future.result()
         except Exception as e:
-            exc = e
+            # FIX: keep the FIRST exception — old code kept only the last,
+            # silently discarding all earlier errors.
+            if exc is None:
+                exc = e
     if exc:
         raise exc
     return out
@@ -531,11 +548,12 @@ def health():
 @app.post("/api/login")
 def login(body: LoginRequest):
     """Employee logs in with THEIR OWN LAROUCHE credentials.
-    Optimised: fields_get + user read run in parallel after auth."""
+    Sequential: fields_get first to know which fields exist, then read user record."""
     email = body.email.strip()
     uid = laroche_authenticate(email, body.password)
 
-    # Check available fields and read user record in parallel
+    # NOTE: _get_fields() must run BEFORE _read_user() because the fields list
+    # is an input to the second call — these two calls are intentionally sequential.
     def _get_fields():
         wanted_fields = ["name", "company_id", "property_warehouse_id"]
         try:
@@ -619,7 +637,8 @@ def auto_resolve_swag_warehouse(branch_info: dict, swag_partner_id: int | None =
 def _resolve_branch(branch_id: int, branch_name: str, branch_info: dict, employee_name: str):
     key = str(branch_id)
     mapping = load_branch_partner_map()
-    swag_partner_id = mapping.get(key) or _resolved_cache.get(key)
+    with _resolved_cache_lock:  # FIX: lock before reading shared cache
+        swag_partner_id = mapping.get(key) or _resolved_cache.get(key)
     matched_on = "saved mapping" if swag_partner_id else None
 
     if not swag_partner_id:
@@ -633,7 +652,8 @@ def _resolve_branch(branch_id: int, branch_name: str, branch_info: dict, employe
                 "candidates": candidates[:40],
             }
         swag_partner_id = resolved_id
-        _resolved_cache[key] = swag_partner_id
+        with _resolved_cache_lock:  # FIX: lock before writing shared cache
+            _resolved_cache[key] = swag_partner_id
         mapping[key] = swag_partner_id
         save_branch_partner_map(mapping)
 
@@ -1025,55 +1045,11 @@ def _fetch_product_packagings(product_id: int) -> list:
 
 @app.get("/api/products/{product_id}/my-shop-stock")
 def product_my_shop_stock(product_id: int, authorization: str | None = Header(None)):
-    """Branch's own on-hand stock for this product (from LAROUCHE).  Cached 2 min."""
+    """Branch's own on-hand stock for this product (from LAROUCHE).  Cached 2 min.
+    FIX: delegates to _fetch_my_shop_stock helper to avoid logic duplication."""
     payload = read_token(authorization)
     branch_key = payload["branch_key"]
-    cache_key = f"mystock:{product_id}:{branch_key}"
-    cached = _cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    recs = swag_execute("product.product", "read", [[product_id]], {"fields": ["default_code", "name"]})
-    code = recs[0].get("default_code") if recs else None
-    if not code:
-        result = {"matched": False, "quantity": None, "reason": "This product has no code to match by."}
-        _cache.set(cache_key, result, TTL_MY_SHOP_STOCK)
-        return result
-
-    laroche_products = laroche_admin_execute(
-        "product.product", "search_read", [[["default_code", "=", code]]], {"fields": ["id", "name"]}
-    )
-    if len(laroche_products) != 1:
-        reason = "not found in LAROUCHE" if not laroche_products else "multiple LAROUCHE products share this code"
-        result = {"matched": False, "quantity": None, "reason": reason}
-        _cache.set(cache_key, result, TTL_MY_SHOP_STOCK)
-        return result
-    laroche_product_id = laroche_products[0]["id"]
-
-    warehouse_id = int(branch_key)
-    quants = laroche_admin_execute(
-        "stock.quant", "search_read",
-        [[["product_id", "=", laroche_product_id], ["location_id.usage", "=", "internal"], ["quantity", "!=", 0]]],
-        {"fields": ["location_id", "quantity"]},
-    )
-    if not quants:
-        result = {"matched": True, "quantity": 0, "laroche_product_name": laroche_products[0]["name"]}
-        _cache.set(cache_key, result, TTL_MY_SHOP_STOCK)
-        return result
-
-    location_ids = list({q["location_id"][0] for q in quants if q.get("location_id")})
-    locations = laroche_admin_execute("stock.location", "read", [location_ids], {"fields": ["warehouse_id"]})
-    loc_to_wh_id = {loc["id"]: (loc["warehouse_id"][0] if loc.get("warehouse_id") else None) for loc in locations}
-
-    total = sum(
-        q["quantity"]
-        for q in quants
-        if (loc := q.get("location_id")) and loc_to_wh_id.get(loc[0]) == warehouse_id
-    )
-
-    result = {"matched": True, "quantity": total, "laroche_product_name": laroche_products[0]["name"]}
-    _cache.set(cache_key, result, TTL_MY_SHOP_STOCK)
-    return result
+    return _fetch_my_shop_stock(product_id, branch_key)
 
 
 @app.get("/api/products/{product_id}/full-details")
@@ -1164,7 +1140,13 @@ def _fetch_my_shop_stock(product_id: int, branch_key: str) -> dict:
         _cache.set(cache_key, r, TTL_MY_SHOP_STOCK)
         return r
     laroche_product_id = laroche_products[0]["id"]
-    warehouse_id = int(branch_key)
+    # FIX: branch_key is stored as a string in JWT; guard against non-numeric values.
+    try:
+        warehouse_id = int(branch_key)
+    except (ValueError, TypeError):
+        r = {"matched": False, "quantity": None, "reason": "Invalid branch key — cannot determine warehouse."}
+        _cache.set(cache_key, r, TTL_MY_SHOP_STOCK)
+        return r
     quants = laroche_admin_execute(
         "stock.quant", "search_read",
         [[["product_id", "=", laroche_product_id], ["location_id.usage", "=", "internal"], ["quantity", "!=", 0]]],
@@ -1250,21 +1232,7 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
     order_lines = []
     for item in items:
         if item.get("packaging_id"):
-            # Ordering by packaging (e.g. "1 × P12").
-            # packaging_id  = product.packaging record id (NOT a uom.uom id).
-            # packaging_qty = number of packs the user selected (e.g. 1).
-            # qty           = total base-UOM quantity = packaging.qty × packaging_qty
-            #                 (already calculated by the frontend and sent as `qty`).
-            #
-            # Correct Odoo sale.order.line fields:
-            #   product_packaging_id  → the product.packaging record id
-            #   product_packaging_qty → number of packs
-            #   product_uom_qty       → total base units (Odoo may auto-compute this
-            #                           when product_packaging_id is set, but we send
-            #                           it explicitly as the safe fallback)
-            #
-            # DO NOT set product_uom to a packaging id — product_uom must be a
-            # uom.uom record id (the product's own UoM), not a packaging record.
+            # ORDERING WITH THE PAKCING
             packaging_qty = item.get("packaging_qty")
             if not packaging_qty or float(packaging_qty) <= 0:
                 packaging_qty = 1.0
@@ -1447,6 +1415,17 @@ def submit_pending_order(body: PendingOrderRequest, authorization: str | None = 
         })
     amount_total = sum(i["qty"] * i["price"] for i in items_with_names)
 
+    # FIX: resolve warehouse_name so it's stored in the DB (was always None before)
+    warehouse_name: str | None = None
+    if body.warehouse_id:
+        try:
+            wh_recs = swag_execute(
+                "stock.warehouse", "read", [[body.warehouse_id]], {"fields": ["name"]}
+            )
+            warehouse_name = wh_recs[0]["name"] if wh_recs else None
+        except Exception:
+            pass  # non-critical — warehouse_name is informational only
+
     db = database.get_session()
     try:
         row = database.PendingOrder(
@@ -1455,6 +1434,7 @@ def submit_pending_order(body: PendingOrderRequest, authorization: str | None = 
             swag_partner_id=payload["swag_partner_id"],
             requested_by=payload.get("employee_name") or "unknown",
             warehouse_id=body.warehouse_id,
+            warehouse_name=warehouse_name,
             note=body.note,
             items_json=json.dumps(items_with_names),
             amount_total=amount_total,
@@ -1505,7 +1485,15 @@ def approve_pending_order(pending_id: int, body: DecidePendingRequest, authoriza
     payload = read_token(authorization)
     db = database.get_session()
     try:
-        row = db.query(database.PendingOrder).filter(database.PendingOrder.id == pending_id).first()
+        # FIX: with_for_update() acquires a row-level lock so two simultaneous
+        # approve requests cannot both pass the status == 'pending' check and
+        # create two SWAG orders. Note: on SQLite (dev) this is a no-op.
+        row = (
+            db.query(database.PendingOrder)
+            .filter(database.PendingOrder.id == pending_id)
+            .with_for_update()
+            .first()
+        )
         if not row:
             raise HTTPException(404, "Pending order not found.")
         if row.branch_key != payload["branch_key"]:
@@ -1711,12 +1699,16 @@ def order_graph(days: int = 30, authorization: str | None = Header(None)):
     payload = read_token(authorization)
     db = database.get_session()
     try:
-        rows = (
+        # FIX: filter by date in the DB query — old code loaded ALL rows then
+        # sliced in Python, which is slow when a branch has many orders.
+        query = (
             db.query(database.OrderRecord)
             .filter(database.OrderRecord.branch_key == payload["branch_key"])
-            .order_by(database.OrderRecord.created_at.asc())
-            .all()
         )
+        if days:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            query = query.filter(database.OrderRecord.created_at >= cutoff)
+        rows = query.order_by(database.OrderRecord.created_at.asc()).all()
         by_day: dict[str, dict] = {}
         for r in rows:
             day = r.created_at.strftime("%Y-%m-%d")
@@ -1724,7 +1716,7 @@ def order_graph(days: int = 30, authorization: str | None = Header(None)):
             bucket["orders"] += 1
             bucket["total"] += r.amount_total or 0
         series = sorted(by_day.values(), key=lambda b: b["date"])
-        return {"series": series[-days:] if days else series}
+        return {"series": series}
     finally:
         db.close()
 
@@ -1790,7 +1782,13 @@ def admin_graph(days: int = 30, authorization: str | None = Header(None)):
     read_admin_token(authorization)
     db = database.get_session()
     try:
-        rows = db.query(database.OrderRecord).order_by(database.OrderRecord.created_at.asc()).all()
+        # FIX: filter by date in the DB query — old code loaded ALL rows then
+        # sliced in Python, which is memory-inefficient at scale.
+        query = db.query(database.OrderRecord)
+        if days:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            query = query.filter(database.OrderRecord.created_at >= cutoff)
+        rows = query.order_by(database.OrderRecord.created_at.asc()).all()
         by_day: dict[str, dict] = {}
         for r in rows:
             day = r.created_at.strftime("%Y-%m-%d")
@@ -1798,7 +1796,7 @@ def admin_graph(days: int = 30, authorization: str | None = Header(None)):
             bucket["orders"] += 1
             bucket["total"] += r.amount_total or 0
         series = sorted(by_day.values(), key=lambda b: b["date"])
-        return {"series": series[-days:] if days else series}
+        return {"series": series}
     finally:
         db.close()
 
@@ -1895,5 +1893,7 @@ def admin_clear_cache(authorization: str | None = Header(None)):
     """Flush the entire in-process cache — useful after a product import or
     price update in Odoo without waiting for TTLs to expire."""
     read_admin_token(authorization)
-    _cache._store.clear()
+    # FIX: use the thread-safe _cache.clear() instead of bypassing the lock
+    # by accessing _store directly (which could corrupt dict state under concurrency).
+    _cache.clear()
     return {"ok": True, "message": "Cache cleared."}
