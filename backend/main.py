@@ -872,45 +872,127 @@ def product_stock_by_warehouse(product_id: int, authorization: str | None = Head
 
 @app.get("/api/products/{product_id}/packagings")
 def product_packagings(product_id: int, authorization: str | None = Header(None)):
-    """Alternate UOM/packagings for a product.  Cached 30 min."""
+    """Product.packaging records for a product.  Cached 30 min.
+
+    Reads from product.packaging (not uom.uom).  Each packaging record has:
+      - id   : the product.packaging record id
+      - name : e.g. "P12"
+      - qty  : how many base-UOM units are in one pack (e.g. 12 for P12)
+    """
     read_token(authorization)
     cache_key = f"packagings:{product_id}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
 
-    prod = swag_execute("product.product", "read", [[product_id]], {"fields": ["uom_id", "uom_ids"]})
-    if not prod:
-        result = {"packagings": []}
-        _cache.set(cache_key, result, TTL_PACKAGINGS)
-        return result
-
-    base_uom = prod[0].get("uom_id") or False
-    base_uom_id = base_uom[0] if base_uom else None
-    alt_uom_ids = prod[0].get("uom_ids") or []
-    alt_uom_ids = [uid for uid in alt_uom_ids if uid != base_uom_id]
-    if not alt_uom_ids:
-        result = {"packagings": []}
-        _cache.set(cache_key, result, TTL_PACKAGINGS)
-        return result
-
-    try:
-        uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor_inv"]})
-        packagings = [{"id": u["id"], "name": u["name"], "qty": u["factor_inv"]} for u in uoms]
-    except HTTPException:
-        uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor"]})
-        packagings = [
-            {
-                "id": u["id"],
-                "name": u["name"],
-                "qty": round(1.0 / u["factor"], 6) if u.get("factor") and u["factor"] != 0 else 1,
-            }
-            for u in uoms
-        ]
-    packagings.sort(key=lambda p: p["qty"])
+    # product.packaging is linked to product.product via product_id field.
+    # We need the product.template id from the product.product record first,
+    # because product.packaging links to product_id on the template level
+    # in Odoo 16+. We try both approaches for compatibility.
+    packagings = _fetch_product_packagings(product_id)
     result = {"packagings": packagings}
     _cache.set(cache_key, result, TTL_PACKAGINGS)
     return result
+
+
+def _fetch_product_packagings(product_id: int) -> list:
+    """Read product.packaging records for the given product.product id.
+
+    Odoo stores packagings on product.template, but product.packaging
+    has a `product_id` field that points to product.template in most
+    versions.  We resolve the template id from the product.product record
+    and then search product.packaging by that template id.
+
+    Falls back gracefully if the model or fields are unavailable.
+    """
+    # Step 1: Get product.template id from product.product
+    try:
+        prod_recs = swag_execute(
+            "product.product", "read", [[product_id]],
+            {"fields": ["product_tmpl_id", "uom_id"]}
+        )
+    except Exception:
+        return []
+
+    if not prod_recs:
+        return []
+
+    tmpl = prod_recs[0].get("product_tmpl_id")
+    tmpl_id = tmpl[0] if tmpl else None
+
+    # Step 2: Determine available fields on product.packaging dynamically
+    try:
+        fields_meta = swag_execute("product.packaging", "fields_get", [], {"attributes": ["string", "type"]})
+    except Exception:
+        return []
+
+    if not fields_meta:
+        return []
+
+    # Build the field list to request — always id+name+qty, plus barcode if present
+    available = set(fields_meta.keys())
+    req_fields = [f for f in ["id", "name", "qty", "product_id", "barcode"] if f in available]
+    if "id" not in req_fields:
+        req_fields.insert(0, "id")
+    if "name" not in req_fields or "qty" not in req_fields:
+        # Model doesn't have expected fields — not a standard product.packaging
+        return []
+
+    # Step 3: Search product.packaging records.
+    # Try by product_tmpl_id first (Odoo 14+), fall back to product_id (template)
+    pkg_records = []
+
+    # Try filtering by product_id (which in product.packaging is the template)
+    if tmpl_id:
+        try:
+            pkg_records = swag_execute(
+                "product.packaging", "search_read",
+                [[[("product_id", "=", tmpl_id)]]],
+                {"fields": req_fields}
+            )
+        except Exception:
+            pkg_records = []
+
+    # If nothing found via template, try direct search_read with no filter
+    # and match by product code (less precise but safe fallback)
+    if not pkg_records:
+        try:
+            # Some Odoo versions store packaging on product.product directly
+            pkg_records = swag_execute(
+                "product.packaging", "search_read",
+                [[]],
+                {"fields": req_fields, "limit": 500}
+            )
+            # Filter client-side for this product's template
+            if tmpl_id:
+                pkg_records = [
+                    r for r in pkg_records
+                    if r.get("product_id") and (
+                        (isinstance(r["product_id"], list) and r["product_id"][0] == tmpl_id)
+                        or r["product_id"] == tmpl_id
+                    )
+                ]
+        except Exception:
+            return []
+
+    if not pkg_records:
+        return []
+
+    packagings = []
+    for r in pkg_records:
+        raw_qty = r.get("qty")
+        try:
+            qty = float(raw_qty) if raw_qty is not None else 1.0
+        except (TypeError, ValueError):
+            qty = 1.0
+        packagings.append({
+            "id": r["id"],
+            "name": r.get("name") or f"Pack {r['id']}",
+            "qty": qty,
+        })
+
+    packagings.sort(key=lambda p: p["qty"])
+    return packagings
 
 
 @app.get("/api/products/{product_id}/my-shop-stock")
@@ -1023,33 +1105,12 @@ def _fetch_stock(product_id: int) -> dict:
 
 
 def _fetch_packagings(product_id: int) -> dict:
+    """Internal helper: uses same product.packaging logic as the route handler."""
     cache_key = f"packagings:{product_id}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
-    prod = swag_execute("product.product", "read", [[product_id]], {"fields": ["uom_id", "uom_ids"]})
-    if not prod:
-        r = {"packagings": []}
-        _cache.set(cache_key, r, TTL_PACKAGINGS)
-        return r
-    base_uom = prod[0].get("uom_id") or False
-    base_uom_id = base_uom[0] if base_uom else None
-    alt_uom_ids = [uid for uid in (prod[0].get("uom_ids") or []) if uid != base_uom_id]
-    if not alt_uom_ids:
-        r = {"packagings": []}
-        _cache.set(cache_key, r, TTL_PACKAGINGS)
-        return r
-    try:
-        uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor_inv"]})
-        packagings = [{"id": u["id"], "name": u["name"], "qty": u["factor_inv"]} for u in uoms]
-    except HTTPException:
-        uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor"]})
-        packagings = [
-            {"id": u["id"], "name": u["name"],
-             "qty": round(1.0 / u["factor"], 6) if u.get("factor") and u["factor"] != 0 else 1}
-            for u in uoms
-        ]
-    packagings.sort(key=lambda p: p["qty"])
+    packagings = _fetch_product_packagings(product_id)
     r = {"packagings": packagings}
     _cache.set(cache_key, r, TTL_PACKAGINGS)
     return r
@@ -1120,24 +1181,43 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
     for item in items:
         if item.get("packaging_id"):
             # Ordering by packaging (e.g. "1 × P12").
-            # packaging_qty = number of packs (e.g. 1), packaging_id = uom.uom id (P12).
-            # Odoo interprets product_uom_qty in that UOM, so "1 P12" = 12 base pieces.
+            # packaging_id  = product.packaging record id (NOT a uom.uom id).
+            # packaging_qty = number of packs the user selected (e.g. 1).
+            # qty           = total base-UOM quantity = packaging.qty × packaging_qty
+            #                 (already calculated by the frontend and sent as `qty`).
+            #
+            # Correct Odoo sale.order.line fields:
+            #   product_packaging_id  → the product.packaging record id
+            #   product_packaging_qty → number of packs
+            #   product_uom_qty       → total base units (Odoo may auto-compute this
+            #                           when product_packaging_id is set, but we send
+            #                           it explicitly as the safe fallback)
+            #
+            # DO NOT set product_uom to a packaging id — product_uom must be a
+            # uom.uom record id (the product's own UoM), not a packaging record.
             packaging_qty = item.get("packaging_qty")
-            if not packaging_qty or packaging_qty <= 0:
+            if not packaging_qty or float(packaging_qty) <= 0:
                 packaging_qty = 1.0
+            packaging_qty = float(packaging_qty)
+
+            # Total qty in base units — sent by frontend as item["qty"]
+            total_qty = float(item.get("qty") or 0)
+            if total_qty <= 0:
+                # Fallback: we don't have total qty; Odoo will compute it from packaging
+                total_qty = packaging_qty  # Odoo will fix via onchange
+
             line_vals = {
                 "product_id": item["product_id"],
-                "product_uom": item["packaging_id"],
-                "product_uom_qty": float(packaging_qty),
+                "product_packaging_id": item["packaging_id"],
+                "product_packaging_qty": packaging_qty,
+                "product_uom_qty": total_qty,
             }
         else:
             qty = float(item.get("qty") or 0)
             # Safety net: if the frontend sent a fractional qty that looks like
-            # a packaging conversion (e.g. 0.083333 = 1/12 of P12) without
-            # sending a packaging_id, Odoo would round it to 0 and reject with
-            # "quantity cannot be zero / negative".  Round up to nearest 1 so
-            # at minimum 1 piece is ordered.  The user can see the note in the
-            # order and correct if needed — this is far better than a hard 400.
+            # a packaging conversion without sending a packaging_id, Odoo would
+            # round it to 0 and reject.  Round up to 1 so at minimum 1 piece
+            # is ordered — far better than a hard 400.
             if qty <= 0:
                 raise HTTPException(400, f"Product id {item['product_id']}: quantity must be greater than zero.")
             if qty < 1.0:
