@@ -896,128 +896,131 @@ def product_packagings(product_id: int, authorization: str | None = Header(None)
 
 
 def _fetch_product_packagings(product_id: int) -> list:
-    """Read product.packaging records for the given product.product id.
+    """Read packaging records for a product — tries every possible approach.
 
-    Tries every known way Odoo stores packaging across versions:
-    1. product.packaging filtered by product_tmpl_id (template id) — Odoo 14+
-    2. product.packaging filtered by product_id (template id) — most versions
-    3. product.packaging filtered by product_id = product.product id directly
-    4. Full scan of all product.packaging + client-side filter — ultimate fallback
+    Odoo has TWO packaging models depending on version and modules:
+      A) product.packaging  — linked to product.template via product_id
+      B) product.packaging  — linked differently in some versions
+      C) packaging_ids      — Many2many/One2many on product.template itself
 
-    Returns list of {id, name, qty} dicts sorted by qty ascending.
+    We try all approaches and return the first non-empty result.
     """
-    # Step 1: Get product.template id and product.product id
+
+    # ── Step 1: get template id ───────────────────────────────────────────
     try:
-        prod_recs = swag_execute(
+        prod_rec = swag_execute(
             "product.product", "read", [[product_id]],
-            {"fields": ["product_tmpl_id", "uom_id"]}
+            {"fields": ["product_tmpl_id"]}
         )
     except Exception:
         return []
 
-    if not prod_recs:
+    if not prod_rec:
         return []
 
-    tmpl = prod_recs[0].get("product_tmpl_id")
-    tmpl_id = tmpl[0] if tmpl else None
+    tmpl_raw = prod_rec[0].get("product_tmpl_id")
+    tmpl_id = tmpl_raw[0] if isinstance(tmpl_raw, list) else tmpl_raw
 
-    # Step 2: Check which fields exist on product.packaging
+    # ── Step 2: Try reading packaging_ids directly from product.template ──
+    # This is the most reliable — template has a packaging_ids field
+    if tmpl_id:
+        try:
+            tmpl_rec = swag_execute(
+                "product.template", "read", [[tmpl_id]],
+                {"fields": ["packaging_ids"]}
+            )
+            pkg_ids = (tmpl_rec[0].get("packaging_ids") or []) if tmpl_rec else []
+            if pkg_ids:
+                pkg_recs = swag_execute(
+                    "product.packaging", "read", [pkg_ids],
+                    {"fields": ["id", "name", "qty"]}
+                )
+                if pkg_recs:
+                    result = []
+                    for r in pkg_recs:
+                        try:
+                            qty = float(r.get("qty") or 1)
+                        except Exception:
+                            qty = 1.0
+                        if qty > 0:
+                            result.append({"id": r["id"], "name": r.get("name") or f"Pack {r['id']}", "qty": qty})
+                    if result:
+                        result.sort(key=lambda p: p["qty"])
+                        return result
+        except Exception:
+            pass
+
+    # ── Step 3: search product.packaging by product_id = tmpl_id ─────────
+    if tmpl_id:
+        try:
+            recs = swag_execute(
+                "product.packaging", "search_read",
+                [[[("product_id", "=", tmpl_id)]]],
+                {"fields": ["id", "name", "qty"]}
+            )
+            if recs:
+                result = []
+                for r in recs:
+                    try:
+                        qty = float(r.get("qty") or 1)
+                    except Exception:
+                        qty = 1.0
+                    if qty > 0:
+                        result.append({"id": r["id"], "name": r.get("name") or f"Pack {r['id']}", "qty": qty})
+                if result:
+                    result.sort(key=lambda p: p["qty"])
+                    return result
+        except Exception:
+            pass
+
+    # ── Step 4: search product.packaging by product_id = product.product id
     try:
-        fields_meta = swag_execute(
-            "product.packaging", "fields_get", [],
-            {"attributes": ["string", "type", "relation"]}
+        recs = swag_execute(
+            "product.packaging", "search_read",
+            [[[("product_id", "=", product_id)]]],
+            {"fields": ["id", "name", "qty"]}
         )
+        if recs:
+            result = []
+            for r in recs:
+                try:
+                    qty = float(r.get("qty") or 1)
+                except Exception:
+                    qty = 1.0
+                if qty > 0:
+                    result.append({"id": r["id"], "name": r.get("name") or f"Pack {r['id']}", "qty": qty})
+            if result:
+                result.sort(key=lambda p: p["qty"])
+                return result
     except Exception:
-        return []
+        pass
 
-    if not fields_meta:
-        return []
+    # ── Step 5: full scan fallback ────────────────────────────────────────
+    try:
+        all_recs = swag_execute(
+            "product.packaging", "search_read",
+            [[]],
+            {"fields": ["id", "name", "qty", "product_id"], "limit": 2000}
+        )
+        match_ids = set(x for x in [tmpl_id, product_id] if x)
+        result = []
+        for r in (all_recs or []):
+            pid = r.get("product_id")
+            pid_val = pid[0] if isinstance(pid, list) else pid
+            if pid_val in match_ids:
+                try:
+                    qty = float(r.get("qty") or 1)
+                except Exception:
+                    qty = 1.0
+                if qty > 0:
+                    result.append({"id": r["id"], "name": r.get("name") or f"Pack {r['id']}", "qty": qty})
+        if result:
+            result.sort(key=lambda p: p["qty"])
+            return result
+    except Exception:
+        pass
 
-    available = set(fields_meta.keys())
-    if "qty" not in available or "name" not in available:
-        return []
-
-    req_fields = [f for f in ["id", "name", "qty", "product_id"] if f in available]
-
-    # Check if product.packaging.product_id points to template or product.product
-    pkg_product_id_relation = (fields_meta.get("product_id") or {}).get("relation", "")
-    # pkg_product_id_relation will be "product.template" or "product.product"
-
-    pkg_records = []
-
-    # --- Attempt A: filter by tmpl_id if relation is product.template ---
-    if tmpl_id and "product.template" in pkg_product_id_relation:
-        try:
-            pkg_records = swag_execute(
-                "product.packaging", "search_read",
-                [[[("product_id", "=", tmpl_id)]]],
-                {"fields": req_fields}
-            )
-        except Exception:
-            pkg_records = []
-
-    # --- Attempt B: filter by product.product id directly ---
-    if not pkg_records:
-        try:
-            pkg_records = swag_execute(
-                "product.packaging", "search_read",
-                [[[("product_id", "=", product_id)]]],
-                {"fields": req_fields}
-            )
-        except Exception:
-            pkg_records = []
-
-    # --- Attempt C: filter by tmpl_id (even if relation unknown) ---
-    if not pkg_records and tmpl_id:
-        try:
-            pkg_records = swag_execute(
-                "product.packaging", "search_read",
-                [[[("product_id", "=", tmpl_id)]]],
-                {"fields": req_fields}
-            )
-        except Exception:
-            pkg_records = []
-
-    # --- Attempt D: full scan + client-side filter ---
-    if not pkg_records:
-        try:
-            all_pkgs = swag_execute(
-                "product.packaging", "search_read",
-                [[]],
-                {"fields": req_fields, "limit": 1000}
-            )
-            # Match by product_id field — could be template or product.product id
-            match_ids = set(filter(None, [tmpl_id, product_id]))
-            for r in (all_pkgs or []):
-                pid = r.get("product_id")
-                if not pid:
-                    continue
-                pid_val = pid[0] if isinstance(pid, list) else pid
-                if pid_val in match_ids:
-                    pkg_records.append(r)
-        except Exception:
-            return []
-
-    if not pkg_records:
-        return []
-
-    packagings = []
-    for r in pkg_records:
-        raw_qty = r.get("qty")
-        try:
-            qty = float(raw_qty) if raw_qty is not None else 1.0
-        except (TypeError, ValueError):
-            qty = 1.0
-        if qty <= 0:
-            qty = 1.0
-        packagings.append({
-            "id": r["id"],
-            "name": r.get("name") or f"Pack {r['id']}",
-            "qty": qty,
-        })
-
-    packagings.sort(key=lambda p: p["qty"])
-    return packagings
+    return []
 
 
 @app.get("/api/products/{product_id}/my-shop-stock")
