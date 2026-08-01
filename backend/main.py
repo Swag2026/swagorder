@@ -846,11 +846,27 @@ def product_packagings(product_id: int, authorization: str | None = Header(None)
     if not alt_uom_ids:
         return {"packagings": []}
 
-    uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor_inv"]})
-    packagings = [
-        {"id": u["id"], "name": u["name"], "qty": u["factor_inv"]}
-        for u in uoms
-    ]
+    # Odoo ≤16 exposes factor_inv directly; Odoo 17+ removed that stored
+    # field — only factor (= 1 / factor_inv) is available. Try the old name
+    # first so this works on both versions without any config change.
+    try:
+        uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor_inv"]})
+        packagings = [
+            {"id": u["id"], "name": u["name"], "qty": u["factor_inv"]}
+            for u in uoms
+        ]
+    except HTTPException:
+        # Odoo 17+: factor_inv was removed; compute pieces-per-unit from factor.
+        # factor = (reference units per 1 of this UOM)^-1, so qty = 1 / factor.
+        uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor"]})
+        packagings = [
+            {
+                "id": u["id"],
+                "name": u["name"],
+                "qty": round(1.0 / u["factor"], 6) if u.get("factor") and u["factor"] != 0 else 1,
+            }
+            for u in uoms
+        ]
     packagings.sort(key=lambda p: p["qty"])
     return {"packagings": packagings}
 
@@ -914,6 +930,8 @@ def list_swag_warehouses(authorization: str | None = Header(None)):
 def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name, branch_name, branch_key):
     """Core order-creation logic — shared by the direct 'Submit' path and the
     manager-approval path (once a pending order is approved)."""
+    line_warehouse_field = find_field_by_label("sale.order.line", ["warehouse"]) if warehouse_id else None
+
     order_lines = []
     for item in items:
         if item.get("packaging_id"):
@@ -929,6 +947,8 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
             }
         else:
             line_vals = {"product_id": item["product_id"], "product_uom_qty": item["qty"]}
+        if line_warehouse_field:
+            line_vals[line_warehouse_field] = warehouse_id
         order_lines.append((0, 0, line_vals))
     note_lines = [f"Ordered via Branch Portal by {employee_name} ({branch_name})"]
     if note:
@@ -962,6 +982,16 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
     # Writing it again right after forces our explicit choice to stick.
     if warehouse_id:
         swag_execute("sale.order", "write", [[order_id], {"warehouse_id": warehouse_id}])
+
+    # Same force-write for the custom per-LINE warehouse field, if this SWAG
+    # instance has one (separate from the order-header warehouse_id above).
+    if warehouse_id and line_warehouse_field:
+        try:
+            line_ids = swag_execute("sale.order.line", "search", [[["order_id", "=", order_id]]])
+            if line_ids:
+                swag_execute("sale.order.line", "write", [line_ids, {line_warehouse_field: warehouse_id}])
+        except Exception:
+            pass  # non-critical — order still gets created either way
 
     detail_fields = [
         "name", "partner_id", "partner_invoice_id", "partner_shipping_id",
