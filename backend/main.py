@@ -132,19 +132,20 @@ TTL_MY_SHOP_STOCK     = 120    # 2 min
 # BRANCH-PARTNER MAP
 # ─────────────────────────────────────────────────────────────────────────────
 def load_branch_partner_map() -> dict:
-    """{ "<larache_warehouse_id>": swag_partner_id }"""
-    if not MAP_FILE.exists():
-        return {}
+    """{ "<larache_warehouse_id>": swag_partner_id } — stored in the
+    database (not a local file), so it survives redeploys."""
     try:
-        raw = json.loads(MAP_FILE.read_text())
-        return {str(k): int(v) for k, v in raw.items()}
+        return {str(k): int(v) for k, v in database.get_all_branch_mappings().items()}
     except Exception:
         return {}
 
 
 def save_branch_partner_map(mapping: dict) -> None:
+    """Persists every entry in `mapping` to the database. Safe to call with
+    the full dict each time (e.g. after adding one new confirmed entry)."""
     try:
-        MAP_FILE.write_text(json.dumps(mapping, indent=2, ensure_ascii=False))
+        for k, v in mapping.items():
+            database.set_branch_mapping(str(k), int(v))
     except Exception:
         pass
 
@@ -296,8 +297,7 @@ def find_field_by_label(model: str, keywords: list[str]) -> str | None:
     try:
         meta = swag_execute(model, "fields_get", [], {"attributes": ["string"]})
     except Exception:
-        _field_label_cache[cache_key] = None
-        return None
+        return None  # don't cache — a transient error shouldn't permanently disable this
     keywords_lower = [k.lower() for k in keywords]
     found = None
     for fname, finfo in (meta or {}).items():
@@ -914,6 +914,10 @@ def product_packagings(product_id: int, authorization: str | None = Header(None)
     Reads from the product's own `uom_ids` (alternate Units of Measure) —
     this SWAG instance doesn't have the standard product.packaging model at
     all; see _fetch_product_packagings for the full explanation.
+
+    This is a convenience feature only — any failure here must NEVER
+    surface as an error to the branch; it just falls back to no packaging
+    options (plain per-unit ordering).
     """
     read_token(authorization)
     cache_key = f"packagings:{product_id}"
@@ -921,11 +925,10 @@ def product_packagings(product_id: int, authorization: str | None = Header(None)
     if cached is not None:
         return cached
 
-    # product.packaging is linked to product.product via product_id field.
-    # We need the product.template id from the product.product record first,
-    # because product.packaging links to product_id on the template level
-    # in Odoo 16+. We try both approaches for compatibility.
-    packagings = _fetch_product_packagings(product_id)
+    try:
+        packagings = _fetch_product_packagings(product_id)
+    except Exception:
+        packagings = []
     result = {"packagings": packagings}
     _cache.set(cache_key, result, TTL_PACKAGINGS)
     return result
@@ -957,12 +960,25 @@ def _fetch_product_packagings(product_id: int) -> list:
     if not alt_uom_ids:
         return []
 
-    try:
-        uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor_inv"]})
-    except Exception:
+    # The "how many base units" field on uom.uom varies by Odoo version
+    # (factor_inv in older versions, something else in newer ones) — try
+    # each candidate until one works, rather than assuming.
+    uoms = None
+    # Confirmed via Odoo's own field list: this version uses `relative_factor`
+    # ("Contains" — how many of the reference unit this UoM equals), paired
+    # with `relative_uom_id` ("Reference Unit"). Older Odoo versions instead
+    # use `factor` ("Absolute Quantity") or `factor_inv`/`ratio`. Try in that
+    # order so this keeps working if the SWAG Odoo version ever changes.
+    for qty_field in ("relative_factor", "factor", "factor_inv", "ratio"):
+        try:
+            uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", qty_field]})
+            break
+        except Exception:
+            continue
+    if uoms is None:
         return []
 
-    result = [{"id": u["id"], "name": u["name"], "qty": u["factor_inv"]} for u in uoms if u.get("factor_inv")]
+    result = [{"id": u["id"], "name": u["name"], "qty": u.get(qty_field)} for u in uoms if u.get(qty_field)]
     result.sort(key=lambda p: p["qty"])
     return result
 
@@ -1125,12 +1141,10 @@ def _detect_line_warehouse_field() -> str | None:
     try:
         meta = swag_execute("sale.order.line", "fields_get", [], {"attributes": ["string", "relation", "type"]})
     except Exception:
-        _field_label_cache[cache_key] = None
-        return None
+        return None  # don't cache — a transient error shouldn't permanently disable this
 
     if not meta:
-        _field_label_cache[cache_key] = None
-        return None
+        return None  # don't cache — empty response is suspicious, worth retrying next time
 
     # Priority 1: any many2one field whose relation is stock.warehouse
     for fname, finfo in meta.items():
@@ -1148,42 +1162,6 @@ def _detect_line_warehouse_field() -> str | None:
 
     _field_label_cache[cache_key] = None
     return None
-
-
-def _resolve_delivery_address(swag_partner_id: int, branch_name: str) -> int | None:
-    """The matched SWAG customer (swag_partner_id) is often a shared parent
-    entity (many outlets share one VAT/legal entity) with delivery
-    sub-addresses (child contacts, type='delivery') for each physical
-    location. If we don't pick the right one, Odoo defaults
-    partner_shipping_id to the parent's own generic address — wrong branch.
-    This finds the child delivery contact that matches THIS outlet's own
-    location, same scoring approach as customer/warehouse matching.
-    """
-    try:
-        children = swag_execute(
-            "res.partner", "search_read",
-            [[["parent_id", "=", swag_partner_id], ["type", "=", "delivery"]]],
-            {"fields": ["id", "name"]},
-        )
-    except Exception:
-        return None
-    if not children:
-        return None
-    if len(children) == 1:
-        return children[0]["id"]
-
-    _, _, outlet_part = branch_name.partition(" — ")
-    keywords = _brand_keywords(outlet_part or branch_name)
-    if not keywords:
-        return None
-    scored = [(c, len(keywords & set(_norm(c["name"]).split()))) for c in children]
-    scored = [(c, s) for c, s in scored if s > 0]
-    if not scored:
-        return None
-    scored.sort(key=lambda cs: cs[1], reverse=True)
-    top = scored[0][1]
-    winners = [c for c, s in scored if s == top]
-    return winners[0]["id"] if len(winners) == 1 else None
 
 
 def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name, branch_name, branch_key):
@@ -1237,9 +1215,8 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
     if warehouse_id:
         vals["warehouse_id"] = warehouse_id
 
-    delivery_address_id = _resolve_delivery_address(swag_partner_id, branch_name)
-    if delivery_address_id:
-        vals["partner_shipping_id"] = delivery_address_id
+    delivery_address_id = swag_partner_id  # exact matched customer's own address, always
+    vals["partner_shipping_id"] = delivery_address_id
 
     order_id = swag_execute("sale.order", "create", [vals], {})
 
