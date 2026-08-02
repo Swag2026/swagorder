@@ -296,8 +296,7 @@ def find_field_by_label(model: str, keywords: list[str]) -> str | None:
     try:
         meta = swag_execute(model, "fields_get", [], {"attributes": ["string"]})
     except Exception:
-        _field_label_cache[cache_key] = None
-        return None
+        return None  # don't cache — a transient error shouldn't permanently disable this
     keywords_lower = [k.lower() for k in keywords]
     found = None
     for fname, finfo in (meta or {}).items():
@@ -1125,12 +1124,10 @@ def _detect_line_warehouse_field() -> str | None:
     try:
         meta = swag_execute("sale.order.line", "fields_get", [], {"attributes": ["string", "relation", "type"]})
     except Exception:
-        _field_label_cache[cache_key] = None
-        return None
+        return None  # don't cache — a transient error shouldn't permanently disable this
 
     if not meta:
-        _field_label_cache[cache_key] = None
-        return None
+        return None  # don't cache — empty response is suspicious, worth retrying next time
 
     # Priority 1: any many2one field whose relation is stock.warehouse
     for fname, finfo in meta.items():
@@ -1148,6 +1145,42 @@ def _detect_line_warehouse_field() -> str | None:
 
     _field_label_cache[cache_key] = None
     return None
+
+
+def _resolve_delivery_address(swag_partner_id: int, branch_name: str) -> int | None:
+    """The matched SWAG customer (swag_partner_id) is often a shared parent
+    entity (many outlets share one VAT/legal entity) with delivery
+    sub-addresses (child contacts, type='delivery') for each physical
+    location. If we don't pick the right one, Odoo defaults
+    partner_shipping_id to the parent's own generic address — wrong branch.
+    This finds the child delivery contact that matches THIS outlet's own
+    location, same scoring approach as customer/warehouse matching.
+    """
+    try:
+        children = swag_execute(
+            "res.partner", "search_read",
+            [[["parent_id", "=", swag_partner_id], ["type", "=", "delivery"]]],
+            {"fields": ["id", "name"]},
+        )
+    except Exception:
+        return None
+    if not children:
+        return None
+    if len(children) == 1:
+        return children[0]["id"]
+
+    _, _, outlet_part = branch_name.partition(" — ")
+    keywords = _brand_keywords(outlet_part or branch_name)
+    if not keywords:
+        return None
+    scored = [(c, len(keywords & set(_norm(c["name"]).split()))) for c in children]
+    scored = [(c, s) for c, s in scored if s > 0]
+    if not scored:
+        return None
+    scored.sort(key=lambda cs: cs[1], reverse=True)
+    top = scored[0][1]
+    winners = [c for c, s in scored if s == top]
+    return winners[0]["id"] if len(winners) == 1 else None
 
 
 def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name, branch_name, branch_key):
@@ -1201,6 +1234,10 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
     if warehouse_id:
         vals["warehouse_id"] = warehouse_id
 
+    delivery_address_id = _resolve_delivery_address(swag_partner_id, branch_name)
+    if delivery_address_id:
+        vals["partner_shipping_id"] = delivery_address_id
+
     order_id = swag_execute("sale.order", "create", [vals], {})
 
     # Fix salesperson + warehouse in parallel (non-critical best-effort writes)
@@ -1227,8 +1264,15 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
                 except Exception:
                     pass
 
+    def _fix_delivery():
+        if delivery_address_id:
+            try:
+                swag_execute("sale.order", "write", [[order_id], {"partner_shipping_id": delivery_address_id}])
+            except Exception:
+                pass
+
     # Run both fixes concurrently
-    run_parallel(fix_sp=_fix_salesperson, fix_wh=_fix_warehouse)
+    run_parallel(fix_sp=_fix_salesperson, fix_wh=_fix_warehouse, fix_addr=_fix_delivery)
 
     detail_fields = [
         "name", "partner_id", "partner_invoice_id", "partner_shipping_id",
