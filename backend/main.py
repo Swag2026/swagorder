@@ -176,8 +176,25 @@ app.add_middleware(
 # ODOO HELPERS  (each call creates its own proxy — xmlrpc proxies are not
 # thread-safe when shared, so we create per-call instances)
 # ─────────────────────────────────────────────────────────────────────────────
+class _TimeoutTransport(xmlrpc.client.SafeTransport):
+    """Same as the default HTTPS transport, but with a socket timeout — so a
+    slow/unresponsive Odoo server gives us a clear error in ~30s instead of
+    hanging until Railway's own gateway times out (502, no useful info)."""
+
+    def __init__(self, timeout=30, use_datetime=False):
+        super().__init__(use_datetime=use_datetime)
+        self.timeout = timeout
+
+    def make_connection(self, host):
+        conn = super().make_connection(host)
+        conn.timeout = self.timeout
+        return conn
+
+
 def _proxy(url: str, endpoint: str):
-    return xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/{endpoint}", allow_none=True)
+    return xmlrpc.client.ServerProxy(
+        f"{url}/xmlrpc/2/{endpoint}", allow_none=True, transport=_TimeoutTransport(timeout=30)
+    )
 
 
 def laroche_authenticate(email: str, password: str) -> int:
@@ -892,12 +909,11 @@ def product_stock_by_warehouse(product_id: int, authorization: str | None = Head
 
 @app.get("/api/products/{product_id}/packagings")
 def product_packagings(product_id: int, authorization: str | None = Header(None)):
-    """Product.packaging records for a product.  Cached 30 min.
+    """Packaging options for a product. Cached 30 min.
 
-    Reads from product.packaging (not uom.uom).  Each packaging record has:
-      - id   : the product.packaging record id
-      - name : e.g. "P12"
-      - qty  : how many base-UOM units are in one pack (e.g. 12 for P12)
+    Reads from the product's own `uom_ids` (alternate Units of Measure) —
+    this SWAG instance doesn't have the standard product.packaging model at
+    all; see _fetch_product_packagings for the full explanation.
     """
     read_token(authorization)
     cache_key = f"packagings:{product_id}"
@@ -916,131 +932,39 @@ def product_packagings(product_id: int, authorization: str | None = Header(None)
 
 
 def _fetch_product_packagings(product_id: int) -> list:
-    """Read packaging records for a product — tries every possible approach.
+    """Read packaging options for a product.
 
-    Odoo has TWO packaging models depending on version and modules:
-      A) product.packaging  — linked to product.template via product_id
-      B) product.packaging  — linked differently in some versions
-      C) packaging_ids      — Many2many/One2many on product.template itself
-
-    We try all approaches and return the first non-empty result.
+    IMPORTANT: this SWAG instance does NOT have the standard Odoo
+    `product.packaging` model at all — confirmed via direct XML-RPC test
+    ("Object product.packaging doesn't exist"). What the UI labels
+    "Packagings" is actually the `uom_ids` field (alternate Units of
+    Measure, e.g. "P12" = 12 base units), confirmed via Odoo's own
+    field-inspector: Field: uom_ids, Model: product.template, Relation:
+    uom.uom. So we read the product's own uom_ids/uom_id and look up each
+    alternate unit's size via uom.uom (excluding the base unit — ordering
+    "1 unit" isn't offered when packagings exist).
     """
-
-    # ── Step 1: get template id ───────────────────────────────────────────
     try:
-        prod_rec = swag_execute(
-            "product.product", "read", [[product_id]],
-            {"fields": ["product_tmpl_id"]}
-        )
+        prod = swag_execute("product.product", "read", [[product_id]], {"fields": ["uom_id", "uom_ids"]})
+    except Exception:
+        return []
+    if not prod:
+        return []
+
+    base_uom = prod[0].get("uom_id") or False
+    base_uom_id = base_uom[0] if base_uom else None
+    alt_uom_ids = [uid for uid in (prod[0].get("uom_ids") or []) if uid != base_uom_id]
+    if not alt_uom_ids:
+        return []
+
+    try:
+        uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor_inv"]})
     except Exception:
         return []
 
-    if not prod_rec:
-        return []
-
-    tmpl_raw = prod_rec[0].get("product_tmpl_id")
-    tmpl_id = tmpl_raw[0] if isinstance(tmpl_raw, list) else tmpl_raw
-
-    # ── Step 2: Try reading packaging_ids directly from product.template ──
-    # This is the most reliable — template has a packaging_ids field
-    if tmpl_id:
-        try:
-            tmpl_rec = swag_execute(
-                "product.template", "read", [[tmpl_id]],
-                {"fields": ["packaging_ids"]}
-            )
-            pkg_ids = (tmpl_rec[0].get("packaging_ids") or []) if tmpl_rec else []
-            if pkg_ids:
-                pkg_recs = swag_execute(
-                    "product.packaging", "read", [pkg_ids],
-                    {"fields": ["id", "name", "qty"]}
-                )
-                if pkg_recs:
-                    result = []
-                    for r in pkg_recs:
-                        try:
-                            qty = float(r.get("qty") or 1)
-                        except Exception:
-                            qty = 1.0
-                        if qty > 0:
-                            result.append({"id": r["id"], "name": r.get("name") or f"Pack {r['id']}", "qty": qty})
-                    if result:
-                        result.sort(key=lambda p: p["qty"])
-                        return result
-        except Exception:
-            pass
-
-    # ── Step 3: search product.packaging by product_id = tmpl_id ─────────
-    if tmpl_id:
-        try:
-            recs = swag_execute(
-                "product.packaging", "search_read",
-                [[[("product_id", "=", tmpl_id)]]],
-                {"fields": ["id", "name", "qty"]}
-            )
-            if recs:
-                result = []
-                for r in recs:
-                    try:
-                        qty = float(r.get("qty") or 1)
-                    except Exception:
-                        qty = 1.0
-                    if qty > 0:
-                        result.append({"id": r["id"], "name": r.get("name") or f"Pack {r['id']}", "qty": qty})
-                if result:
-                    result.sort(key=lambda p: p["qty"])
-                    return result
-        except Exception:
-            pass
-
-    # ── Step 4: search product.packaging by product_id = product.product id
-    try:
-        recs = swag_execute(
-            "product.packaging", "search_read",
-            [[[("product_id", "=", product_id)]]],
-            {"fields": ["id", "name", "qty"]}
-        )
-        if recs:
-            result = []
-            for r in recs:
-                try:
-                    qty = float(r.get("qty") or 1)
-                except Exception:
-                    qty = 1.0
-                if qty > 0:
-                    result.append({"id": r["id"], "name": r.get("name") or f"Pack {r['id']}", "qty": qty})
-            if result:
-                result.sort(key=lambda p: p["qty"])
-                return result
-    except Exception:
-        pass
-
-    # ── Step 5: full scan fallback ────────────────────────────────────────
-    try:
-        all_recs = swag_execute(
-            "product.packaging", "search_read",
-            [[]],
-            {"fields": ["id", "name", "qty", "product_id"], "limit": 2000}
-        )
-        match_ids = set(x for x in [tmpl_id, product_id] if x)
-        result = []
-        for r in (all_recs or []):
-            pid = r.get("product_id")
-            pid_val = pid[0] if isinstance(pid, list) else pid
-            if pid_val in match_ids:
-                try:
-                    qty = float(r.get("qty") or 1)
-                except Exception:
-                    qty = 1.0
-                if qty > 0:
-                    result.append({"id": r["id"], "name": r.get("name") or f"Pack {r['id']}", "qty": qty})
-        if result:
-            result.sort(key=lambda p: p["qty"])
-            return result
-    except Exception:
-        pass
-
-    return []
+    result = [{"id": u["id"], "name": u["name"], "qty": u["factor_inv"]} for u in uoms if u.get("factor_inv")]
+    result.sort(key=lambda p: p["qty"])
+    return result
 
 
 @app.get("/api/products/{product_id}/my-shop-stock")
