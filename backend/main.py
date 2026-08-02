@@ -863,12 +863,20 @@ def product_packagings(product_id: int, authorization: str | None = Header(None)
     if not alt_uom_ids:
         return {"packagings": []}
 
-    uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor_inv"]})
-    packagings = [
-        {"id": u["id"], "name": u["name"], "qty": u["factor_inv"]}
-        for u in uoms
-    ]
-    packagings.sort(key=lambda p: p["qty"])
+    uoms = None
+    for qty_field in ("factor_inv", "factor", "ratio"):
+        try:
+            uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", qty_field]})
+            uoms = [{"id": u["id"], "name": u["name"], "qty": u[qty_field]} for u in uoms]
+            break
+        except Exception:
+            uoms = None
+    if uoms is None:
+        # Last resort: just names, qty unknown (still lets branch pick the box by name)
+        raw = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name"]})
+        uoms = [{"id": u["id"], "name": u["name"], "qty": None} for u in raw]
+    packagings = uoms
+    packagings.sort(key=lambda p: (p["qty"] is None, p["qty"]))
     return {"packagings": packagings}
 
 
