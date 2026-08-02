@@ -92,19 +92,6 @@ class PendingOrder(Base):
     decided_at = Column(DateTime, nullable=True)
 
 
-class BranchMapping(Base):
-    """Branch -> SWAG customer mapping — stored in the database (not a local
-    file) specifically so it SURVIVES redeploys. A local JSON file gets
-    wiped every time Railway rebuilds the container, which was silently
-    losing every human-confirmed mapping and forcing re-confirmation on
-    every single deploy."""
-    __tablename__ = "branch_mappings"
-
-    branch_key = Column(String, primary_key=True)
-    swag_partner_id = Column(Integer, nullable=False)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-
-
 Base.metadata.create_all(engine)
 
 
@@ -131,38 +118,6 @@ def log_order(**kwargs):
     db = get_session()
     try:
         db.add(OrderRecord(**kwargs))
-        db.commit()
-    finally:
-        db.close()
-
-
-def get_all_branch_mappings() -> dict:
-    """{ "<branch_key>": swag_partner_id } for every branch ever confirmed."""
-    db = get_session()
-    try:
-        rows = db.query(BranchMapping).all()
-        return {r.branch_key: r.swag_partner_id for r in rows}
-    finally:
-        db.close()
-
-
-def set_branch_mapping(branch_key: str, swag_partner_id: int) -> None:
-    db = get_session()
-    try:
-        row = db.query(BranchMapping).filter(BranchMapping.branch_key == str(branch_key)).first()
-        if row:
-            row.swag_partner_id = swag_partner_id
-        else:
-            db.add(BranchMapping(branch_key=str(branch_key), swag_partner_id=swag_partner_id))
-        db.commit()
-    finally:
-        db.close()
-
-
-def delete_branch_mapping(branch_key: str) -> None:
-    db = get_session()
-    try:
-        db.query(BranchMapping).filter(BranchMapping.branch_key == str(branch_key)).delete()
         db.commit()
     finally:
         db.close()
