@@ -1,5 +1,5 @@
 """
-SWAG Branch Order Portal — Backend  (Performance-Optimised Build)
+SWAG Branch Order Portal — Backend
 -----------------------------------
 Each branch employee logs in with their OWN LAROUCHE Odoo credentials (for
 accountability — every order can be traced to who placed it). Their login
@@ -27,7 +27,7 @@ phone/location-keyword matching) and falls back to a one-time human pick
 Deploy: Railway (this folder as the service root).
 
 Env vars required (Railway → Variables):
-    LAROUCHE_URL            e.g. https://outfit.larache.sa  (NO trailing /odoo)
+    LAROUCHE_URL            e.g. https://outfit.laroche.sa  (NO trailing /odoo)
     LAROUCHE_DB             e.g. db3
     LAROUCHE_ADMIN_USER     LAROUCHE admin-style account email (warehouse listing only)
     LAROUCHE_ADMIN_API_KEY  that account's password/API key
@@ -41,18 +41,13 @@ Env vars required (Railway → Variables):
 
 import os
 import json
-import time
 import xmlrpc.client
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock
-from typing import Any
 
 import jwt
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
 import database
@@ -61,78 +56,24 @@ import database
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 LAROUCHE_URL = os.environ.get("LAROUCHE_URL", "").rstrip("/")
-LAROUCHE_DB  = os.environ.get("LAROUCHE_DB", "")
-LAROUCHE_ADMIN_USER    = os.environ.get("LAROUCHE_ADMIN_USER", "")
+LAROUCHE_DB = os.environ.get("LAROUCHE_DB", "")
+LAROUCHE_ADMIN_USER = os.environ.get("LAROUCHE_ADMIN_USER", "")
 LAROUCHE_ADMIN_API_KEY = os.environ.get("LAROUCHE_ADMIN_API_KEY", "")
 
-SWAG_URL     = os.environ.get("SWAG_URL", "").rstrip("/")
-SWAG_DB      = os.environ.get("SWAG_DB", "")
-SWAG_USER    = os.environ.get("SWAG_USER", "")
+SWAG_URL = os.environ.get("SWAG_URL", "").rstrip("/")
+SWAG_DB = os.environ.get("SWAG_DB", "")
+SWAG_USER = os.environ.get("SWAG_USER", "")
 SWAG_API_KEY = os.environ.get("SWAG_API_KEY", "")
 
-JWT_SECRET      = os.environ.get("JWT_SECRET", "change-me-in-railway-variables")
+JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-railway-variables")
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-ADMIN_PASSWORD  = os.environ.get("ADMIN_PASSWORD", "")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 MAP_FILE = Path(__file__).parent / "branch_partner_map.json"
 
-# Thread pool shared across all requests — XML-RPC calls release the GIL so
-# threads give real parallelism here.
-_executor = ThreadPoolExecutor(max_workers=12)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SIMPLE TTL CACHE
-# ─────────────────────────────────────────────────────────────────────────────
-class _TTLCache:
-    """Thread-safe in-memory cache with per-key TTL (seconds)."""
-
-    def __init__(self):
-        self._store: dict[str, tuple[Any, float]] = {}
-        self._lock = Lock()
-
-    def get(self, key: str):
-        with self._lock:
-            entry = self._store.get(key)
-            if entry and time.monotonic() < entry[1]:
-                return entry[0]
-            return None  # missing or expired
-
-    def set(self, key: str, value: Any, ttl: int):
-        with self._lock:
-            self._store[key] = (value, time.monotonic() + ttl)
-
-    def delete(self, key: str):
-        with self._lock:
-            self._store.pop(key, None)
-
-    def clear_prefix(self, prefix: str):
-        with self._lock:
-            keys = [k for k in self._store if k.startswith(prefix)]
-            for k in keys:
-                del self._store[k]
-
-    def clear(self):
-        """Flush all entries (thread-safe). Use this instead of accessing _store directly."""
-        with self._lock:
-            self._store.clear()
-
-
-_cache = _TTLCache()
-
-# Cache TTLs (seconds)
-TTL_SWAG_WAREHOUSES   = 1800   # 30 min  — warehouse list rarely changes
-TTL_PRODUCTS          = 300    # 5 min   — product list + prices
-TTL_PACKAGINGS        = 1800   # 30 min  — UOM/packaging config rarely changes
-TTL_PRODUCT_STOCK     = 120    # 2 min   — stock moves fast
-TTL_MY_SHOP_STOCK     = 120    # 2 min
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BRANCH-PARTNER MAP
-# ─────────────────────────────────────────────────────────────────────────────
 def load_branch_partner_map() -> dict:
-    """{ "<larache_warehouse_id>": swag_partner_id }"""
+    """{ "<laroche_warehouse_id>": swag_partner_id }"""
     if not MAP_FILE.exists():
         return {}
     try:
@@ -143,6 +84,10 @@ def load_branch_partner_map() -> dict:
 
 
 def save_branch_partner_map(mapping: dict) -> None:
+    """Persist a resolved mapping so future selections skip the auto-match
+    search. Best-effort: on ephemeral-filesystem hosts this may not survive a
+    redeploy, but it still avoids repeat lookups during the running instance
+    and gives the admin a file to inspect/edit directly."""
     try:
         MAP_FILE.write_text(json.dumps(mapping, indent=2, ensure_ascii=False))
     except Exception:
@@ -150,19 +95,9 @@ def save_branch_partner_map(mapping: dict) -> None:
 
 
 _resolved_cache: dict[str, int] = {}
-_resolved_cache_lock = Lock()  # FIX: dict is shared across threads; protect reads/writes
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# APP
-# ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="SWAG Branch Order Portal API")
 
-# NOTE: Starlette applies middleware in LIFO order (last-added runs first).
-# GZipMiddleware is first here so it runs LAST (compresses the final response).
-# CORSMiddleware is second so it runs FIRST (adds headers before anything else).
-# Swapping these two would break CORS preflight — do NOT reorder.
-app.add_middleware(GZipMiddleware, minimum_size=500)   # compress JSON responses
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -173,8 +108,7 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ODOO HELPERS  (each call creates its own proxy — xmlrpc proxies are not
-# thread-safe when shared, so we create per-call instances)
+# ODOO HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 class _TimeoutTransport(xmlrpc.client.SafeTransport):
     """Same as the default HTTPS transport, but with a socket timeout — so a
@@ -198,6 +132,8 @@ def _proxy(url: str, endpoint: str):
 
 
 def laroche_authenticate(email: str, password: str) -> int:
+    """Authenticate with the EMPLOYEE'S OWN LAROUCHE credentials — this is
+    what gives us accountability (every order traces back to who logged in)."""
     if not (LAROUCHE_URL and LAROUCHE_DB):
         raise HTTPException(500, "Server is missing LAROUCHE_URL / LAROUCHE_DB configuration.")
     try:
@@ -210,6 +146,7 @@ def laroche_authenticate(email: str, password: str) -> int:
 
 
 def laroche_execute_as(uid: int, password: str, model: str, method: str, args: list, kwargs: dict | None = None):
+    """Run a call under a specific (already-authenticated) LAROUCHE user."""
     try:
         return _proxy(LAROUCHE_URL, "object").execute_kw(
             LAROUCHE_DB, uid, password, model, method, args, kwargs or {}
@@ -220,27 +157,25 @@ def laroche_execute_as(uid: int, password: str, model: str, method: str, args: l
         raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
 
 
-_laroche_admin_uid_lock = Lock()  # FIX: guard shared uid cache against race conditions
 _laroche_admin_uid_cache: int | None = None
 
 
 def laroche_admin_uid() -> int:
+    """Authenticate the LAROUCHE admin-style account once and cache the uid.
+    Used ONLY for reliably listing warehouses — never for identity."""
     global _laroche_admin_uid_cache
-    with _laroche_admin_uid_lock:
-        if _laroche_admin_uid_cache:
-            return _laroche_admin_uid_cache
-        if not (LAROUCHE_URL and LAROUCHE_DB and LAROUCHE_ADMIN_USER and LAROUCHE_ADMIN_API_KEY):
-            raise HTTPException(500, "Server is missing LAROUCHE_ADMIN_USER / LAROUCHE_ADMIN_API_KEY.")
-        try:
-            uid = _proxy(LAROUCHE_URL, "common").authenticate(
-                LAROUCHE_DB, LAROUCHE_ADMIN_USER, LAROUCHE_ADMIN_API_KEY, {}
-            )
-        except Exception as e:
-            raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
-        if not uid:
-            raise HTTPException(500, "LAROUCHE admin account credentials are invalid.")
-        _laroche_admin_uid_cache = uid
-        return uid
+    if _laroche_admin_uid_cache:
+        return _laroche_admin_uid_cache
+    if not (LAROUCHE_URL and LAROUCHE_DB and LAROUCHE_ADMIN_USER and LAROUCHE_ADMIN_API_KEY):
+        raise HTTPException(500, "Server is missing LAROUCHE_ADMIN_USER / LAROUCHE_ADMIN_API_KEY.")
+    try:
+        uid = _proxy(LAROUCHE_URL, "common").authenticate(LAROUCHE_DB, LAROUCHE_ADMIN_USER, LAROUCHE_ADMIN_API_KEY, {})
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
+    if not uid:
+        raise HTTPException(500, "LAROUCHE admin account credentials are invalid.")
+    _laroche_admin_uid_cache = uid
+    return uid
 
 
 def laroche_admin_execute(model: str, method: str, args: list, kwargs: dict | None = None):
@@ -254,25 +189,23 @@ def laroche_admin_execute(model: str, method: str, args: list, kwargs: dict | No
         raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
 
 
-_swag_uid_lock = Lock()  # FIX: guard shared uid cache against race conditions
 _swag_uid_cache: int | None = None
 
 
 def swag_uid() -> int:
     global _swag_uid_cache
-    with _swag_uid_lock:
-        if _swag_uid_cache:
-            return _swag_uid_cache
-        if not (SWAG_URL and SWAG_DB and SWAG_USER and SWAG_API_KEY):
-            raise HTTPException(500, "Server is missing SWAG_URL / SWAG_DB / SWAG_USER / SWAG_API_KEY.")
-        try:
-            uid = _proxy(SWAG_URL, "common").authenticate(SWAG_DB, SWAG_USER, SWAG_API_KEY, {})
-        except Exception as e:
-            raise HTTPException(502, f"Could not reach SWAG Odoo: {e}")
-        if not uid:
-            raise HTTPException(500, "SWAG service account credentials are invalid.")
-        _swag_uid_cache = uid
-        return uid
+    if _swag_uid_cache:
+        return _swag_uid_cache
+    if not (SWAG_URL and SWAG_DB and SWAG_USER and SWAG_API_KEY):
+        raise HTTPException(500, "Server is missing SWAG_URL / SWAG_DB / SWAG_USER / SWAG_API_KEY.")
+    try:
+        uid = _proxy(SWAG_URL, "common").authenticate(SWAG_DB, SWAG_USER, SWAG_API_KEY, {})
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach SWAG Odoo: {e}")
+    if not uid:
+        raise HTTPException(500, "SWAG service account credentials are invalid.")
+    _swag_uid_cache = uid
+    return uid
 
 
 def swag_execute(model: str, method: str, args: list, kwargs: dict | None = None):
@@ -296,7 +229,8 @@ def find_field_by_label(model: str, keywords: list[str]) -> str | None:
     try:
         meta = swag_execute(model, "fields_get", [], {"attributes": ["string"]})
     except Exception:
-        return None  # don't cache — a transient error shouldn't permanently disable this
+        _field_label_cache[cache_key] = None
+        return None
     keywords_lower = [k.lower() for k in keywords]
     found = None
     for fname, finfo in (meta or {}).items():
@@ -325,16 +259,41 @@ _GENERIC_NAME_WORDS = {
 
 def _brand_keywords(name: str | None) -> set[str]:
     words = _norm(name).split()
+    # len >= 3 (not 2) — short 2-letter fragments are too easy to coincide
+    # with an unrelated word purely by chance (e.g. a mis-spelled variant of
+    # the brand name matching a completely unrelated record).
     return {w for w in words if w not in _GENERIC_NAME_WORDS and len(w) >= 3}
 
 
 def _clean_warehouse_name(name: str) -> str:
+    """Warehouse names look like 'W101/ مستودع جدة' or '205/ اوت فيت الامير
+    سلطان' — the part before '/' is just an internal code; the part after it
+    is the actual outlet name we want to match against SWAG."""
     if "/" in (name or ""):
         return name.split("/", 1)[1].strip()
     return (name or "").strip()
 
 
 def auto_resolve_swag_partner(branch_info: dict):
+    """
+    Try to find the ONE SWAG res.partner that corresponds to this outlet.
+    Checks VAT, email, mobile, phone, exact name (in that order) — the first
+    that returns EXACTLY ONE match wins. VAT is often shared by an entire
+    legal entity across many outlets AND sibling brands, so an ambiguous VAT
+    result does NOT stop us from trying the other identifiers.
+
+    If still ambiguous, candidates are SCORED by how many meaningful words
+    they share with the outlet's own (location-specific) name — e.g. a
+    warehouse named "Outfit - Prince Sultan St" should uniquely outscore
+    "Outfit - Jeddah warehouse" on shared words. Only a clear single top
+    scorer is auto-accepted; ties are left for a human to pick from.
+
+    Returns (partner_id, partner_name, matched_on, candidates).
+    """
+    # Build ONE combined OR query across every identifier we have, instead of
+    # up to 5 separate round-trips to Odoo — this is what made branch
+    # selection feel slow. We still evaluate priority (vat > email > mobile
+    # > phone > name) afterwards, just against data already fetched.
     identifiers = []
     if branch_info.get("vat"):
         identifiers.append(("vat", branch_info["vat"]))
@@ -351,6 +310,7 @@ def auto_resolve_swag_partner(branch_info: dict):
         return None, None, None, []
 
     or_terms = [[field, "=", value] for field, value in identifiers]
+    # Odoo polish-notation OR domain: ["|", "|", term1, term2, term3, ...]
     combined_domain = (["|"] * (len(or_terms) - 1)) + or_terms
 
     all_matches = swag_execute(
@@ -369,6 +329,12 @@ def auto_resolve_swag_partner(branch_info: dict):
                 best_candidates = candidates
 
     if best_candidates:
+        # Only the outlet's LOCATION-specific words should count — words
+        # that are just the brand/company's own name (e.g. "Outfit") appear
+        # in almost every sibling outlet's name too, so they don't actually
+        # discriminate between outlets and can cause false matches (a
+        # mis-spelled brand fragment coincidentally overlapping with an
+        # unrelated record). We strip those out before scoring.
         brand_words = _brand_keywords(branch_info.get("company_name"))
         keywords = _brand_keywords(branch_info.get("name")) - brand_words
         if keywords:
@@ -378,6 +344,11 @@ def auto_resolve_swag_partner(branch_info: dict):
                 scored.sort(key=lambda cs: cs[1], reverse=True)
                 top_score = scored[0][1]
                 top_matches = [c for c, score in scored if score == top_score]
+                # A single unique winner on genuine LOCATION keywords (brand
+                # noise already excluded, generic terms already stopword-
+                # filtered) is trustworthy even at just 1 shared word — e.g.
+                # "Jeddah" or "Abhur" alone is highly specific once brand
+                # words are out of the picture.
                 if len(top_matches) == 1:
                     winner = top_matches[0]
                     return winner["id"], winner["name"], "location keywords", []
@@ -387,40 +358,11 @@ def auto_resolve_swag_partner(branch_info: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PARALLEL HELPER
-# ─────────────────────────────────────────────────────────────────────────────
-def run_parallel(**fns) -> dict:
-    """Run multiple zero-argument callables in parallel and return a dict of
-    results keyed by the same names.  Any exception is re-raised from here.
-
-    Usage:
-        results = run_parallel(
-            warehouses=lambda: swag_execute(...),
-            partner=lambda: swag_execute(...),
-        )
-        warehouses = results["warehouses"]
-    """
-    futures = {_executor.submit(fn): name for name, fn in fns.items()}
-    out = {}
-    exc = None
-    for future in as_completed(futures):
-        name = futures[future]
-        try:
-            out[name] = future.result()
-        except Exception as e:
-            # FIX: keep the FIRST exception — old code kept only the last,
-            # silently discarding all earlier errors.
-            if exc is None:
-                exc = e
-    if exc:
-        raise exc
-    return out
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # AUTH TOKENS
 # ─────────────────────────────────────────────────────────────────────────────
 def make_login_token(email: str, employee_name: str, company_id: int, company_name: str) -> str:
+    """Short-lived token proving the employee already authenticated with
+    their own LAROUCHE credentials — used while they pick their outlet."""
     payload = {
         "type": "login",
         "email": email,
@@ -444,11 +386,8 @@ def read_login_token(token: str) -> dict:
     return payload
 
 
-def make_token(
-    branch_key: str, branch_name: str, swag_partner_id: int, swag_partner_name: str,
-    employee_name: str, default_warehouse_id: int | None = None,
-    default_warehouse_name: str | None = None,
-) -> str:
+def make_token(branch_key: str, branch_name: str, swag_partner_id: int, swag_partner_name: str, employee_name: str,
+                default_warehouse_id: int | None = None, default_warehouse_name: str | None = None) -> str:
     payload = {
         "type": "session",
         "branch_key": branch_key,
@@ -544,7 +483,7 @@ class CartItem(BaseModel):
     product_id: int
     qty: float
     packaging_id: int | None = None
-    packaging_qty: float | None = None
+    packaging_qty: float | None = None  # number of boxes/packages, if ordering by packaging
 
 
 class OrderRequest(BaseModel):
@@ -563,27 +502,24 @@ def health():
 
 @app.post("/api/login")
 def login(body: LoginRequest):
-    """Employee logs in with THEIR OWN LAROUCHE credentials.
-    Sequential: fields_get first to know which fields exist, then read user record."""
+    """Employee logs in with THEIR OWN LAROUCHE credentials — this is what
+    gives us accountability. If their own account is already scoped to a
+    specific warehouse (its 'Default Warehouse' field), we resolve straight
+    to that outlet — no company-wide picker, no access beyond their own
+    warehouse. Only accounts without a default warehouse fall back to
+    picking from their company's outlet list."""
     email = body.email.strip()
     uid = laroche_authenticate(email, body.password)
 
-    # NOTE: _get_fields() must run BEFORE _read_user() because the fields list
-    # is an input to the second call — these two calls are intentionally sequential.
-    def _get_fields():
-        wanted_fields = ["name", "company_id", "property_warehouse_id"]
-        try:
-            meta = laroche_execute_as(uid, body.password, "res.users", "fields_get", [], {"attributes": []})
-            return [f for f in wanted_fields if f in meta]
-        except Exception:
-            return ["name", "company_id"]
+    # Read defensively — property_warehouse_id may not exist on every setup.
+    wanted_fields = ["name", "company_id", "property_warehouse_id"]
+    try:
+        meta = laroche_execute_as(uid, body.password, "res.users", "fields_get", [], {"attributes": []})
+        existing_fields = [f for f in wanted_fields if f in meta]
+    except Exception:
+        existing_fields = ["name", "company_id"]
 
-    def _read_user(fields):
-        return laroche_execute_as(uid, body.password, "res.users", "read", [[uid]], {"fields": fields})
-
-    existing_fields = _get_fields()
-    user_recs = _read_user(existing_fields)
-
+    user_recs = laroche_execute_as(uid, body.password, "res.users", "read", [[uid]], {"fields": existing_fields})
     if not user_recs:
         raise HTTPException(500, "Could not load your LAROUCHE user profile.")
     employee_name = user_recs[0]["name"]
@@ -594,6 +530,9 @@ def login(body: LoginRequest):
 
     own_warehouse = user_recs[0].get("property_warehouse_id") or False
     if own_warehouse:
+        # This login is already scoped to exactly one outlet — resolve
+        # straight through, skipping the picker (and any access to other
+        # outlets under the same brand) entirely.
         result = _resolve_warehouse_to_session(own_warehouse[0], company_id, company_name, employee_name)
         result["single_warehouse"] = True
         return result
@@ -610,6 +549,8 @@ def login(body: LoginRequest):
 
 @app.get("/api/warehouses")
 def list_warehouses(company_id: int, login_token: str):
+    """Every outlet under the LOGGED-IN employee's own company — never lets
+    them browse another brand's outlets."""
     payload = read_login_token(login_token)
     if payload["company_id"] != company_id:
         raise HTTPException(403, "You can only view outlets for your own company.")
@@ -621,6 +562,21 @@ def list_warehouses(company_id: int, login_token: str):
 
 
 def auto_resolve_swag_warehouse(branch_info: dict, swag_partner_id: int | None = None):
+    """
+    Find the SWAG stock.warehouse that represents this outlet's own stock.
+    Two strategies, tried in order of reliability:
+
+      1. Direct link — if a SWAG warehouse's own `partner_id` is exactly the
+         customer we already matched this branch to, that's a guaranteed
+         correct link (no guessing at all).
+      2. Name matching — same scoring approach as customer matching, but
+         against warehouse names (which don't have VAT/email/phone).
+
+    This is a convenience default (which warehouse's stock to show/assume
+    first), NOT a correctness-critical mapping like the customer match, so
+    if nothing is a clear unique winner we simply leave it unset rather than
+    blocking anything — the branch can still pick any warehouse manually.
+    """
     if swag_partner_id:
         try:
             direct = swag_execute(
@@ -630,7 +586,7 @@ def auto_resolve_swag_warehouse(branch_info: dict, swag_partner_id: int | None =
             if len(direct) == 1:
                 return direct[0]["id"], direct[0]["name"]
         except Exception:
-            pass
+            pass  # field may not exist on this Odoo setup — fall through to name matching
 
     brand_words = _brand_keywords(branch_info.get("company_name"))
     keywords = _brand_keywords(branch_info.get("name")) - brand_words
@@ -651,10 +607,11 @@ def auto_resolve_swag_warehouse(branch_info: dict, swag_partner_id: int | None =
 
 
 def _resolve_branch(branch_id: int, branch_name: str, branch_info: dict, employee_name: str):
+    """Shared logic: look up cached mapping, else auto-resolve, else return a
+    selection_required payload."""
     key = str(branch_id)
     mapping = load_branch_partner_map()
-    with _resolved_cache_lock:  # FIX: lock before reading shared cache
-        swag_partner_id = mapping.get(key) or _resolved_cache.get(key)
+    swag_partner_id = mapping.get(key) or _resolved_cache.get(key)
     matched_on = "saved mapping" if swag_partner_id else None
 
     if not swag_partner_id:
@@ -668,22 +625,16 @@ def _resolve_branch(branch_id: int, branch_name: str, branch_info: dict, employe
                 "candidates": candidates[:40],
             }
         swag_partner_id = resolved_id
-        with _resolved_cache_lock:  # FIX: lock before writing shared cache
-            _resolved_cache[key] = swag_partner_id
+        _resolved_cache[key] = swag_partner_id
         mapping[key] = swag_partner_id
         save_branch_partner_map(mapping)
 
-    # Fetch partner name and default warehouse IN PARALLEL
-    results = run_parallel(
-        partner=lambda: swag_execute("res.partner", "read", [[swag_partner_id]], {"fields": ["name"]}),
-        warehouse=lambda: auto_resolve_swag_warehouse(branch_info, swag_partner_id),
-    )
-
-    partner_recs = results["partner"]
+    partner_recs = swag_execute("res.partner", "read", [[swag_partner_id]], {"fields": ["name"]})
     if not partner_recs:
         raise HTTPException(500, f"Mapped SWAG partner id {swag_partner_id} was not found in SWAG Odoo.")
     swag_partner_name = partner_recs[0]["name"]
-    default_warehouse_id, default_warehouse_name = results["warehouse"]
+
+    default_warehouse_id, default_warehouse_name = auto_resolve_swag_warehouse(branch_info, swag_partner_id)
 
     token = make_token(
         key, branch_name, swag_partner_id, swag_partner_name, employee_name,
@@ -700,6 +651,11 @@ def _resolve_branch(branch_id: int, branch_name: str, branch_info: dict, employe
 
 
 def _resolve_warehouse_to_session(warehouse_id: int, company_id: int, company_name: str, employee_name: str):
+    """Given a specific stock.warehouse id (already known to belong to
+    company_id), verify it, build the branch_info used for SWAG matching,
+    and resolve/confirm the session. Shared by /api/select-branch and the
+    auto-resolve-on-login path (when an employee's own account is already
+    scoped to one warehouse)."""
     warehouses = laroche_admin_execute(
         "stock.warehouse", "read", [[warehouse_id]], {"fields": ["name", "company_id"]}
     )
@@ -712,8 +668,7 @@ def _resolve_warehouse_to_session(warehouse_id: int, company_id: int, company_na
     outlet_name = _clean_warehouse_name(warehouse["name"])
     branch_name = f"{company_name} — {outlet_name}"
 
-    # Fetch company partner info (for email/vat matching) in parallel with branch resolve prep
-    branch_info: dict = {"name": outlet_name, "company_name": company_name}
+    branch_info = {"name": outlet_name, "company_name": company_name}
     company = laroche_admin_execute("res.company", "read", [[company_id]], {"fields": ["partner_id"]})
     company_partner = company[0].get("partner_id") if company else False
     if company_partner:
@@ -780,6 +735,7 @@ def confirm_branch(body: ConfirmBranchRequest):
     branch_name = payload.get("branch_name", key)
     employee_name = payload.get("employee_name", "")
 
+    # Best-effort default-warehouse guess: branch_name is "{company} — {outlet}".
     company_part, _, outlet_part = branch_name.partition(" — ")
     default_warehouse_id, default_warehouse_name = auto_resolve_swag_warehouse(
         {"name": outlet_part or branch_name, "company_name": company_part}, body.partner_id
@@ -813,6 +769,10 @@ def me(authorization: str | None = Header(None)):
 
 @app.post("/api/report-wrong-customer")
 def report_wrong_customer(authorization: str | None = Header(None)):
+    """Self-service correction: if a branch employee notices this session is
+    linked to the wrong SWAG customer, this clears the saved mapping for
+    their outlet so the NEXT login re-runs matching (and asks a human to
+    confirm if it's ambiguous) instead of reusing the wrong cached result."""
     payload = read_token(authorization)
     key = payload["branch_key"]
     mapping = load_branch_partner_map()
@@ -826,16 +786,8 @@ def report_wrong_customer(authorization: str | None = Header(None)):
 @app.get("/api/products")
 def search_products(q: str = "", limit: int = 40, authorization: str | None = Header(None)):
     read_token(authorization)
-    q = (q or "").strip()
-
-    # Cache keyed by (query, limit) — empty searches are cached, specific
-    # queries are also cached for 5 min to speed up repeated typing.
-    cache_key = f"products:{q}:{limit}"
-    cached = _cache.get(cache_key)
-    if cached is not None:
-        return cached
-
     domain = [["sale_ok", "=", True]]
+    q = (q or "").strip()
     if q:
         domain = ["&", domain[0], "|", ["default_code", "ilike", q], ["name", "ilike", q]]
     fields = ["id", "default_code", "name", "list_price", "qty_available", "uom_id"]
@@ -843,34 +795,23 @@ def search_products(q: str = "", limit: int = 40, authorization: str | None = He
         "product.product", "search_read",
         [domain], {"fields": fields, "limit": limit, "order": "default_code asc"},
     )
-    result = {"products": products}
-    _cache.set(cache_key, result, TTL_PRODUCTS)
-    return result
+    return {"products": products}
 
 
 @app.get("/api/products/{product_id}/image")
 def product_image(product_id: int, authorization: str | None = Header(None)):
     read_token(authorization)
-    cache_key = f"product_image:{product_id}"
-    cached = _cache.get(cache_key)
-    if cached is not None:
-        return cached
     recs = swag_execute("product.product", "read", [[product_id]], {"fields": ["image_128"]})
     image_b64 = recs[0].get("image_128") if recs else None
-    result = {"image_base64": image_b64}
-    # Images are static — cache for 1 hour
-    _cache.set(cache_key, result, 3600)
-    return result
+    return {"image_base64": image_b64}
 
 
 @app.get("/api/products/{product_id}/stock")
 def product_stock_by_warehouse(product_id: int, authorization: str | None = Header(None)):
-    """Per-warehouse on-hand stock for a product.  Cached 2 min."""
+    """How much of this product sits in EACH SWAG warehouse — not just the
+    total. Reads stock.quant (per-location on-hand quantity), then maps each
+    location back to its warehouse."""
     read_token(authorization)
-    cache_key = f"stock:{product_id}"
-    cached = _cache.get(cache_key)
-    if cached is not None:
-        return cached
 
     quants = swag_execute(
         "stock.quant", "search_read",
@@ -878,9 +819,7 @@ def product_stock_by_warehouse(product_id: int, authorization: str | None = Head
         {"fields": ["location_id", "quantity"]},
     )
     if not quants:
-        result = {"stock_by_warehouse": []}
-        _cache.set(cache_key, result, TTL_PRODUCT_STOCK)
-        return result
+        return {"stock_by_warehouse": []}
 
     location_ids = list({q["location_id"][0] for q in quants if q.get("location_id")})
     locations = swag_execute("stock.location", "read", [location_ids], {"fields": ["warehouse_id"]})
@@ -895,333 +834,123 @@ def product_stock_by_warehouse(product_id: int, authorization: str | None = Head
         key = (wh[0], wh[1]) if wh else (None, "Other / Unassigned")
         totals[key] = totals.get(key, 0) + q["quantity"]
 
-    result_list = [
+    result = [
         {"warehouse_id": wh_id, "warehouse_name": wh_name, "quantity": qty}
         for (wh_id, wh_name), qty in totals.items()
-        if qty
+        if qty  # drop zero totals after summing
     ]
-    result_list.sort(key=lambda r: r["warehouse_name"] or "")
-    result = {"stock_by_warehouse": result_list}
-    _cache.set(cache_key, result, TTL_PRODUCT_STOCK)
-    return result
+    result.sort(key=lambda r: r["warehouse_name"] or "")
+    return {"stock_by_warehouse": result}
 
 
 @app.get("/api/products/{product_id}/packagings")
 def product_packagings(product_id: int, authorization: str | None = Header(None)):
-    """Packaging options for a product. Cached 30 min.
-
-    Reads from the product's own `uom_ids` (alternate Units of Measure) —
-    this SWAG instance doesn't have the standard product.packaging model at
-    all; see _fetch_product_packagings for the full explanation.
-    """
+    """SWAG's own 'Packagings' — in this instance these are actually
+    alternate Units of Measure (the `uom_ids` field on the product, labeled
+    'Packagings' in the UI), e.g. a 'P48' unit worth 48 base units. Returns
+    each alternate unit's id/name/pieces-per-unit, excluding the product's
+    own base unit (ordering "1 unit" isn't offered when packagings exist)."""
     read_token(authorization)
-    cache_key = f"packagings:{product_id}"
-    cached = _cache.get(cache_key)
-    if cached is not None:
-        return cached
 
-    # product.packaging is linked to product.product via product_id field.
-    # We need the product.template id from the product.product record first,
-    # because product.packaging links to product_id on the template level
-    # in Odoo 16+. We try both approaches for compatibility.
-    packagings = _fetch_product_packagings(product_id)
-    result = {"packagings": packagings}
-    _cache.set(cache_key, result, TTL_PACKAGINGS)
-    return result
-
-
-def _fetch_product_packagings(product_id: int) -> list:
-    """Read packaging options for a product.
-
-    IMPORTANT: this SWAG instance does NOT have the standard Odoo
-    `product.packaging` model at all — confirmed via direct XML-RPC test
-    ("Object product.packaging doesn't exist"). What the UI labels
-    "Packagings" is actually the `uom_ids` field (alternate Units of
-    Measure, e.g. "P12" = 12 base units), confirmed via Odoo's own
-    field-inspector: Field: uom_ids, Model: product.template, Relation:
-    uom.uom. So we read the product's own uom_ids/uom_id and look up each
-    alternate unit's size via uom.uom (excluding the base unit — ordering
-    "1 unit" isn't offered when packagings exist).
-    """
-    try:
-        prod = swag_execute("product.product", "read", [[product_id]], {"fields": ["uom_id", "uom_ids"]})
-    except Exception:
-        return []
+    prod = swag_execute("product.product", "read", [[product_id]], {"fields": ["uom_id", "uom_ids"]})
     if not prod:
-        return []
+        return {"packagings": []}
 
     base_uom = prod[0].get("uom_id") or False
     base_uom_id = base_uom[0] if base_uom else None
-    alt_uom_ids = [uid for uid in (prod[0].get("uom_ids") or []) if uid != base_uom_id]
+    alt_uom_ids = prod[0].get("uom_ids") or []
+    alt_uom_ids = [uid for uid in alt_uom_ids if uid != base_uom_id]
     if not alt_uom_ids:
-        return []
+        return {"packagings": []}
 
-    try:
-        uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor_inv"]})
-    except Exception:
-        return []
-
-    result = [{"id": u["id"], "name": u["name"], "qty": u["factor_inv"]} for u in uoms if u.get("factor_inv")]
-    result.sort(key=lambda p: p["qty"])
-    return result
+    uoms = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", "factor_inv"]})
+    packagings = [
+        {"id": u["id"], "name": u["name"], "qty": u["factor_inv"]}
+        for u in uoms
+    ]
+    packagings.sort(key=lambda p: p["qty"])
+    return {"packagings": packagings}
 
 
 @app.get("/api/products/{product_id}/my-shop-stock")
 def product_my_shop_stock(product_id: int, authorization: str | None = Header(None)):
-    """Branch's own on-hand stock for this product (from LAROUCHE).  Cached 2 min.
-    FIX: delegates to _fetch_my_shop_stock helper to avoid logic duplication."""
+    """How much of this SAME product the branch already has on hand in
+    THEIR OWN shop — i.e. LAROUCHE's own stock at their specific outlet
+    (warehouse), not SWAG's supplier-side stock. Matched by product code
+    (default_code) between the two separate Odoo systems."""
     payload = read_token(authorization)
-    branch_key = payload["branch_key"]
-    return _fetch_my_shop_stock(product_id, branch_key)
 
-
-@app.get("/api/products/{product_id}/full-details")
-def product_full_details(product_id: int, authorization: str | None = Header(None)):
-    """NEW: fetch stock + packagings + my-shop-stock all in ONE request, in
-    parallel.  Cuts the product-detail page from 3 serial round-trips to 1.
-    Frontend can call this single endpoint instead of 3 separate ones."""
-    payload = read_token(authorization)
-    branch_key = payload["branch_key"]
-
-    results = run_parallel(
-        stock=lambda: _fetch_stock(product_id),
-        packagings=lambda: _fetch_packagings(product_id),
-        my_shop_stock=lambda: _fetch_my_shop_stock(product_id, branch_key),
-    )
-    return {
-        "stock_by_warehouse": results["stock"]["stock_by_warehouse"],
-        "packagings":         results["packagings"]["packagings"],
-        "my_shop_stock":      results["my_shop_stock"],
-    }
-
-
-# ── internal helpers used by the parallel full-details endpoint ──────────────
-def _fetch_stock(product_id: int) -> dict:
-    cache_key = f"stock:{product_id}"
-    cached = _cache.get(cache_key)
-    if cached is not None:
-        return cached
-    quants = swag_execute(
-        "stock.quant", "search_read",
-        [[["product_id", "=", product_id], ["location_id.usage", "=", "internal"], ["quantity", "!=", 0]]],
-        {"fields": ["location_id", "quantity"]},
-    )
-    if not quants:
-        r = {"stock_by_warehouse": []}
-        _cache.set(cache_key, r, TTL_PRODUCT_STOCK)
-        return r
-    location_ids = list({q["location_id"][0] for q in quants if q.get("location_id")})
-    locations = swag_execute("stock.location", "read", [location_ids], {"fields": ["warehouse_id"]})
-    loc_to_wh = {loc["id"]: loc.get("warehouse_id") for loc in locations}
-    totals: dict[tuple, float] = {}
-    for q in quants:
-        loc = q.get("location_id")
-        if not loc:
-            continue
-        wh = loc_to_wh.get(loc[0])
-        k = (wh[0], wh[1]) if wh else (None, "Other / Unassigned")
-        totals[k] = totals.get(k, 0) + q["quantity"]
-    result_list = [
-        {"warehouse_id": wid, "warehouse_name": wn, "quantity": qty}
-        for (wid, wn), qty in totals.items() if qty
-    ]
-    result_list.sort(key=lambda x: x["warehouse_name"] or "")
-    r = {"stock_by_warehouse": result_list}
-    _cache.set(cache_key, r, TTL_PRODUCT_STOCK)
-    return r
-
-
-def _fetch_packagings(product_id: int) -> dict:
-    """Internal helper: uses same product.packaging logic as the route handler."""
-    cache_key = f"packagings:{product_id}"
-    cached = _cache.get(cache_key)
-    if cached is not None:
-        return cached
-    packagings = _fetch_product_packagings(product_id)
-    r = {"packagings": packagings}
-    _cache.set(cache_key, r, TTL_PACKAGINGS)
-    return r
-
-
-def _fetch_my_shop_stock(product_id: int, branch_key: str) -> dict:
-    cache_key = f"mystock:{product_id}:{branch_key}"
-    cached = _cache.get(cache_key)
-    if cached is not None:
-        return cached
     recs = swag_execute("product.product", "read", [[product_id]], {"fields": ["default_code", "name"]})
     code = recs[0].get("default_code") if recs else None
     if not code:
-        r = {"matched": False, "quantity": None, "reason": "This product has no code to match by."}
-        _cache.set(cache_key, r, TTL_MY_SHOP_STOCK)
-        return r
+        return {"matched": False, "quantity": None, "reason": "This product has no code to match by."}
+
     laroche_products = laroche_admin_execute(
         "product.product", "search_read", [[["default_code", "=", code]]], {"fields": ["id", "name"]}
     )
     if len(laroche_products) != 1:
         reason = "not found in LAROUCHE" if not laroche_products else "multiple LAROUCHE products share this code"
-        r = {"matched": False, "quantity": None, "reason": reason}
-        _cache.set(cache_key, r, TTL_MY_SHOP_STOCK)
-        return r
+        return {"matched": False, "quantity": None, "reason": reason}
     laroche_product_id = laroche_products[0]["id"]
-    # FIX: branch_key is stored as a string in JWT; guard against non-numeric values.
-    try:
-        warehouse_id = int(branch_key)
-    except (ValueError, TypeError):
-        r = {"matched": False, "quantity": None, "reason": "Invalid branch key — cannot determine warehouse."}
-        _cache.set(cache_key, r, TTL_MY_SHOP_STOCK)
-        return r
+
+    warehouse_id = int(payload["branch_key"])
     quants = laroche_admin_execute(
         "stock.quant", "search_read",
         [[["product_id", "=", laroche_product_id], ["location_id.usage", "=", "internal"], ["quantity", "!=", 0]]],
         {"fields": ["location_id", "quantity"]},
     )
     if not quants:
-        r = {"matched": True, "quantity": 0, "laroche_product_name": laroche_products[0]["name"]}
-        _cache.set(cache_key, r, TTL_MY_SHOP_STOCK)
-        return r
+        return {"matched": True, "quantity": 0, "laroche_product_name": laroche_products[0]["name"]}
+
     location_ids = list({q["location_id"][0] for q in quants if q.get("location_id")})
     locations = laroche_admin_execute("stock.location", "read", [location_ids], {"fields": ["warehouse_id"]})
     loc_to_wh_id = {loc["id"]: (loc["warehouse_id"][0] if loc.get("warehouse_id") else None) for loc in locations}
-    total = sum(
-        q["quantity"]
-        for q in quants
-        if (loc := q.get("location_id")) and loc_to_wh_id.get(loc[0]) == warehouse_id
-    )
-    r = {"matched": True, "quantity": total, "laroche_product_name": laroche_products[0]["name"]}
-    _cache.set(cache_key, r, TTL_MY_SHOP_STOCK)
-    return r
+
+    total = 0.0
+    for q in quants:
+        loc = q.get("location_id")
+        if not loc:
+            continue
+        if loc_to_wh_id.get(loc[0]) == warehouse_id:
+            total += q["quantity"]
+
+    return {"matched": True, "quantity": total, "laroche_product_name": laroche_products[0]["name"]}
 
 
 @app.get("/api/swag-warehouses")
 def list_swag_warehouses(authorization: str | None = Header(None)):
-    """SWAG warehouses list.  Cached 30 min — this never changes mid-session."""
+    """SWAG's own warehouses — the branch picks which one should fulfill
+    (source stock for) their order."""
     read_token(authorization)
-    cached = _cache.get("swag_warehouses")
-    if cached is not None:
-        return cached
     warehouses = swag_execute(
         "stock.warehouse", "search_read", [[]], {"fields": ["id", "name", "code"], "order": "name asc"}
     )
-    result = {"warehouses": warehouses}
-    _cache.set("swag_warehouses", result, TTL_SWAG_WAREHOUSES)
-    return result
-
-
-def _detect_line_warehouse_field() -> str | None:
-    """Detect which field on sale.order.line holds the warehouse.
-
-    We try field NAMES and relations directly (not just labels) because
-    Odoo may be in Arabic and label-based matching fails.
-    Known field names across Odoo versions: warehouse_id (custom/community modules).
-    We check which ones actually exist via fields_get and return the first
-    many2one field whose relation is stock.warehouse.
-    Falls back to label search with Arabic keywords as last resort.
-    """
-    cache_key = "sale.order.line:warehouse_field"
-    if cache_key in _field_label_cache:
-        return _field_label_cache[cache_key]
-
-    try:
-        meta = swag_execute("sale.order.line", "fields_get", [], {"attributes": ["string", "relation", "type"]})
-    except Exception:
-        return None  # don't cache — a transient error shouldn't permanently disable this
-
-    if not meta:
-        return None  # don't cache — empty response is suspicious, worth retrying next time
-
-    # Priority 1: any many2one field whose relation is stock.warehouse
-    for fname, finfo in meta.items():
-        if finfo.get("type") == "many2one" and finfo.get("relation") == "stock.warehouse":
-            _field_label_cache[cache_key] = fname
-            return fname
-
-    # Priority 2: label-based fallback with English AND Arabic keywords
-    warehouse_keywords = ["warehouse", "\u0645\u0633\u062a\u0648\u062f\u0639", "\u0645\u062e\u0632\u0646"]
-    for fname, finfo in meta.items():
-        label = (finfo.get("string") or "").lower()
-        if any(kw in label for kw in warehouse_keywords) and finfo.get("type") == "many2one":
-            _field_label_cache[cache_key] = fname
-            return fname
-
-    _field_label_cache[cache_key] = None
-    return None
-
-
-def _resolve_delivery_address(swag_partner_id: int, branch_name: str) -> int | None:
-    """The matched SWAG customer (swag_partner_id) is often a shared parent
-    entity (many outlets share one VAT/legal entity) with delivery
-    sub-addresses (child contacts, type='delivery') for each physical
-    location. If we don't pick the right one, Odoo defaults
-    partner_shipping_id to the parent's own generic address — wrong branch.
-    This finds the child delivery contact that matches THIS outlet's own
-    location, same scoring approach as customer/warehouse matching.
-    """
-    try:
-        children = swag_execute(
-            "res.partner", "search_read",
-            [[["parent_id", "=", swag_partner_id], ["type", "=", "delivery"]]],
-            {"fields": ["id", "name"]},
-        )
-    except Exception:
-        return None
-    if not children:
-        return None
-    if len(children) == 1:
-        return children[0]["id"]
-
-    _, _, outlet_part = branch_name.partition(" — ")
-    keywords = _brand_keywords(outlet_part or branch_name)
-    if not keywords:
-        return None
-    scored = [(c, len(keywords & set(_norm(c["name"]).split()))) for c in children]
-    scored = [(c, s) for c, s in scored if s > 0]
-    if not scored:
-        return None
-    scored.sort(key=lambda cs: cs[1], reverse=True)
-    top = scored[0][1]
-    winners = [c for c, s in scored if s == top]
-    return winners[0]["id"] if len(winners) == 1 else None
+    return {"warehouses": warehouses}
 
 
 def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name, branch_name, branch_key):
-    line_warehouse_field = _detect_line_warehouse_field() if warehouse_id else None
+    """Core order-creation logic — shared by the direct 'Submit' path and the
+    manager-approval path (once a pending order is approved)."""
+    line_warehouse_field = find_field_by_label("sale.order.line", ["warehouse"]) if warehouse_id else None
 
     order_lines = []
     for item in items:
         if item.get("packaging_id"):
-            # ORDERING WITH THE PAKCING
-            packaging_qty = item.get("packaging_qty")
-            if not packaging_qty or float(packaging_qty) <= 0:
-                packaging_qty = 1.0
-            packaging_qty = float(packaging_qty)
-
-            # Total qty in base units — sent by frontend as item["qty"]
-            total_qty = float(item.get("qty") or 0)
-            if total_qty <= 0:
-                # Fallback: we don't have total qty; Odoo will compute it from packaging
-                total_qty = packaging_qty  # Odoo will fix via onchange
-
+            # "packaging_id" here is actually a uom.uom id (an alternate unit
+            # like "P48" = 48 pieces) and "packaging_qty" is the number of
+            # those units (boxes) — Odoo interprets product_uom_qty in terms
+            # of whichever product_uom is set, and handles the pieces
+            # conversion itself.
             line_vals = {
                 "product_id": item["product_id"],
-                "product_packaging_id": item["packaging_id"],
-                "product_packaging_qty": packaging_qty,
-                "product_uom_qty": total_qty,
+                "product_uom": item["packaging_id"],
+                "product_uom_qty": item.get("packaging_qty") or 1,
             }
         else:
-            qty = float(item.get("qty") or 0)
-            # Safety net: if the frontend sent a fractional qty that looks like
-            # a packaging conversion without sending a packaging_id, Odoo would
-            # round it to 0 and reject.  Round up to 1 so at minimum 1 piece
-            # is ordered — far better than a hard 400.
-            if qty <= 0:
-                raise HTTPException(400, f"Product id {item['product_id']}: quantity must be greater than zero.")
-            if qty < 1.0:
-                qty = 1.0   # round-up: fractional base-unit qty not accepted by Odoo
-            line_vals = {"product_id": item["product_id"], "product_uom_qty": qty}
+            line_vals = {"product_id": item["product_id"], "product_uom_qty": item["qty"]}
         if line_warehouse_field:
             line_vals[line_warehouse_field] = warehouse_id
         order_lines.append((0, 0, line_vals))
-
     note_lines = [f"Ordered via Branch Portal by {employee_name} ({branch_name})"]
     if note:
         note_lines.append(note)
@@ -1234,45 +963,36 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
     if warehouse_id:
         vals["warehouse_id"] = warehouse_id
 
-    delivery_address_id = _resolve_delivery_address(swag_partner_id, branch_name)
-    if delivery_address_id:
-        vals["partner_shipping_id"] = delivery_address_id
-
     order_id = swag_execute("sale.order", "create", [vals], {})
 
-    # Fix salesperson + warehouse in parallel (non-critical best-effort writes)
-    def _fix_salesperson():
+    # Odoo defaults the new order's salesperson (user_id) to whichever
+    # account is making the API call (our shared service account) rather
+    # than the customer's own pre-assigned salesperson. If this customer has
+    # one configured, force it onto the order — same pattern as the
+    # warehouse_id fix below.
+    try:
+        partner_recs = swag_execute("res.partner", "read", [[swag_partner_id]], {"fields": ["user_id"]})
+        partner_salesperson = partner_recs[0].get("user_id") if partner_recs else False
+        if partner_salesperson:
+            swag_execute("sale.order", "write", [[order_id], {"user_id": partner_salesperson[0]}])
+    except Exception:
+        pass  # non-critical — order still gets created either way
+
+    # Odoo's warehouse_id is a computed field (defaults from the partner/
+    # company) that can silently override whatever we pass at create() time.
+    # Writing it again right after forces our explicit choice to stick.
+    if warehouse_id:
+        swag_execute("sale.order", "write", [[order_id], {"warehouse_id": warehouse_id}])
+
+    # Same force-write for the custom per-LINE warehouse field, if this SWAG
+    # instance has one (separate from the order-header warehouse_id above).
+    if warehouse_id and line_warehouse_field:
         try:
-            partner_recs = swag_execute("res.partner", "read", [[swag_partner_id]], {"fields": ["user_id"]})
-            partner_salesperson = partner_recs[0].get("user_id") if partner_recs else False
-            if partner_salesperson:
-                swag_execute("sale.order", "write", [[order_id], {"user_id": partner_salesperson[0]}])
+            line_ids = swag_execute("sale.order.line", "search", [[["order_id", "=", order_id]]])
+            if line_ids:
+                swag_execute("sale.order.line", "write", [line_ids, {line_warehouse_field: warehouse_id}])
         except Exception:
-            pass
-
-    def _fix_warehouse():
-        if warehouse_id:
-            try:
-                swag_execute("sale.order", "write", [[order_id], {"warehouse_id": warehouse_id}])
-            except Exception:
-                pass  # non-critical — order already created
-            if line_warehouse_field:
-                try:
-                    line_ids = swag_execute("sale.order.line", "search", [[["order_id", "=", order_id]]])
-                    if line_ids:
-                        swag_execute("sale.order.line", "write", [line_ids, {line_warehouse_field: warehouse_id}])
-                except Exception:
-                    pass
-
-    def _fix_delivery():
-        if delivery_address_id:
-            try:
-                swag_execute("sale.order", "write", [[order_id], {"partner_shipping_id": delivery_address_id}])
-            except Exception:
-                pass
-
-    # Run both fixes concurrently
-    run_parallel(fix_sp=_fix_salesperson, fix_wh=_fix_warehouse, fix_addr=_fix_delivery)
+            pass  # non-critical — order still gets created either way
 
     detail_fields = [
         "name", "partner_id", "partner_invoice_id", "partner_shipping_id",
@@ -1287,21 +1007,21 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
     order = rec[0] if rec else {}
 
     details = {
-        "order_name":      order.get("name"),
-        "customer":        _m2o_name(order.get("partner_id")),
+        "order_name": order.get("name"),
+        "customer": _m2o_name(order.get("partner_id")),
         "invoice_address": _m2o_name(order.get("partner_invoice_id")),
-        "delivery_address":_m2o_name(order.get("partner_shipping_id")),
-        "pricelist":       _m2o_name(order.get("pricelist_id")),
-        "payment_terms":   _m2o_name(order.get("payment_term_id")),
-        "salesperson":     _m2o_name(order.get("user_id")),
-        "warehouse":       _m2o_name(order.get("warehouse_id")),
-        "collector":       _m2o_name(order.get(collector_field)) if collector_field else None,
-        "order_date":      order.get("date_order"),
-        "amount_untaxed":  order.get("amount_untaxed"),
-        "amount_tax":      order.get("amount_tax"),
-        "amount_total":    order.get("amount_total"),
-        "state":           order.get("state"),
-        "ordered_by":      employee_name,
+        "delivery_address": _m2o_name(order.get("partner_shipping_id")),
+        "pricelist": _m2o_name(order.get("pricelist_id")),
+        "payment_terms": _m2o_name(order.get("payment_term_id")),
+        "salesperson": _m2o_name(order.get("user_id")),
+        "warehouse": _m2o_name(order.get("warehouse_id")),
+        "collector": _m2o_name(order.get(collector_field)) if collector_field else None,
+        "order_date": order.get("date_order"),
+        "amount_untaxed": order.get("amount_untaxed"),
+        "amount_tax": order.get("amount_tax"),
+        "amount_total": order.get("amount_total"),
+        "state": order.get("state"),
+        "ordered_by": employee_name,
     }
 
     database.log_order(
@@ -1318,10 +1038,6 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
         amount_total=order.get("amount_total") or 0,
         items_json=json.dumps(items),
     )
-
-    # Bust the product stock cache for all products in this order
-    for item in items:
-        _cache.delete(f"stock:{item['product_id']}")
 
     return order_id, details
 
@@ -1361,17 +1077,12 @@ def submit_pending_order(body: PendingOrderRequest, authorization: str | None = 
     if not body.items:
         raise HTTPException(400, "Cart is empty.")
 
-    # Fetch all product details in ONE batch call instead of N serial calls
-    product_ids = [it.product_id for it in body.items]
-    product_recs = swag_execute(
-        "product.product", "read", [product_ids],
-        {"fields": ["id", "default_code", "name", "list_price"]},
-    )
-    prod_by_id = {r["id"]: r for r in (product_recs or [])}
-
+    # Look up names/prices for a readable summary later.
     items_with_names = []
     for it in body.items:
-        rec = prod_by_id.get(it.product_id, {})
+        recs = swag_execute("product.product", "read", [[it.product_id]],
+                             {"fields": ["default_code", "name", "list_price"]})
+        rec = recs[0] if recs else {}
         items_with_names.append({
             "product_id": it.product_id,
             "default_code": rec.get("default_code"),
@@ -1383,17 +1094,6 @@ def submit_pending_order(body: PendingOrderRequest, authorization: str | None = 
         })
     amount_total = sum(i["qty"] * i["price"] for i in items_with_names)
 
-    # FIX: resolve warehouse_name so it's stored in the DB (was always None before)
-    warehouse_name: str | None = None
-    if body.warehouse_id:
-        try:
-            wh_recs = swag_execute(
-                "stock.warehouse", "read", [[body.warehouse_id]], {"fields": ["name"]}
-            )
-            warehouse_name = wh_recs[0]["name"] if wh_recs else None
-        except Exception:
-            pass  # non-critical — warehouse_name is informational only
-
     db = database.get_session()
     try:
         row = database.PendingOrder(
@@ -1402,7 +1102,6 @@ def submit_pending_order(body: PendingOrderRequest, authorization: str | None = 
             swag_partner_id=payload["swag_partner_id"],
             requested_by=payload.get("employee_name") or "unknown",
             warehouse_id=body.warehouse_id,
-            warehouse_name=warehouse_name,
             note=body.note,
             items_json=json.dumps(items_with_names),
             amount_total=amount_total,
@@ -1418,6 +1117,7 @@ def submit_pending_order(body: PendingOrderRequest, authorization: str | None = 
 
 @app.get("/api/orders/pending")
 def list_pending_orders(authorization: str | None = Header(None)):
+    """Every pending/approved/rejected order for this branch — the approval queue."""
     payload = read_token(authorization)
     db = database.get_session()
     try:
@@ -1450,18 +1150,11 @@ def list_pending_orders(authorization: str | None = Header(None)):
 
 @app.post("/api/orders/pending/{pending_id}/approve")
 def approve_pending_order(pending_id: int, body: DecidePendingRequest, authorization: str | None = Header(None)):
+    """Approve a pending order — THIS is when it actually gets created in SWAG."""
     payload = read_token(authorization)
     db = database.get_session()
     try:
-        # FIX: with_for_update() acquires a row-level lock so two simultaneous
-        # approve requests cannot both pass the status == 'pending' check and
-        # create two SWAG orders. Note: on SQLite (dev) this is a no-op.
-        row = (
-            db.query(database.PendingOrder)
-            .filter(database.PendingOrder.id == pending_id)
-            .with_for_update()
-            .first()
-        )
+        row = db.query(database.PendingOrder).filter(database.PendingOrder.id == pending_id).first()
         if not row:
             raise HTTPException(404, "Pending order not found.")
         if row.branch_key != payload["branch_key"]:
@@ -1508,6 +1201,7 @@ def reject_pending_order(pending_id: int, body: DecidePendingRequest, authorizat
             raise HTTPException(403, "This pending order doesn't belong to your outlet.")
         if row.status != "pending":
             raise HTTPException(400, f"This order was already {row.status}.")
+
         row.status = "rejected"
         row.decided_by = payload.get("employee_name") or "unknown"
         row.decided_at = datetime.now(timezone.utc)
@@ -1524,41 +1218,30 @@ class BulkLookupRequest(BaseModel):
 
 @app.post("/api/products/bulk-lookup")
 def bulk_lookup_products(body: BulkLookupRequest, authorization: str | None = Header(None)):
-    """Excel bulk-order upload: look up N product codes in ONE Odoo call
-    (was: one call per code in a loop — O(N) round-trips → O(1) round-trips)."""
+    """Used by the Excel bulk-order upload: given a list of product codes
+    (default_code), find each one's exact match in SWAG. Codes that don't
+    match anything (or match more than one product) are returned separately
+    so the branch can review them by hand — never guessed."""
     read_token(authorization)
     codes = [c.strip() for c in body.codes if c and c.strip()]
-    if not codes:
-        return {"matched": [], "not_found": []}
-
-    # Single batch query for all codes
-    domain = ["|"] * (len(codes) - 1) + [["default_code", "=", c] for c in codes]
-    recs = swag_execute(
-        "product.product", "search_read",
-        [domain],
-        {"fields": ["id", "default_code", "name", "list_price", "qty_available"]},
-    )
-
-    # Group by code — a code is "matched" only if exactly one product has it
-    by_code: dict[str, list] = {}
-    for r in (recs or []):
-        c = (r.get("default_code") or "").strip()
-        by_code.setdefault(c, []).append(r)
-
     matched = []
     not_found = []
     for code in codes:
-        hits = by_code.get(code, [])
-        if len(hits) == 1:
-            matched.append(hits[0])
+        recs = swag_execute(
+            "product.product", "search_read",
+            [[["default_code", "=", code]]],
+            {"fields": ["id", "default_code", "name", "list_price", "qty_available"]},
+        )
+        if len(recs) == 1:
+            matched.append(recs[0])
         else:
-            not_found.append(code)  # 0 = missing, 2+ = ambiguous
-
+            not_found.append(code)
     return {"matched": matched, "not_found": not_found}
 
 
 @app.get("/api/products/by-barcode")
 def product_by_barcode(code: str, authorization: str | None = Header(None)):
+    """Used by the barcode scanner — look up a product by its exact barcode."""
     read_token(authorization)
     code = (code or "").strip()
     if not code:
@@ -1577,6 +1260,8 @@ def product_by_barcode(code: str, authorization: str | None = Header(None)):
 
 @app.get("/api/my-orders")
 def my_orders(limit: int = 50, authorization: str | None = Header(None)):
+    """Order history for the logged-in branch's own SWAG customer — powers
+    the 'My Orders' dashboard."""
     payload = read_token(authorization)
     orders = swag_execute(
         "sale.order", "search_read",
@@ -1592,8 +1277,43 @@ def my_orders(limit: int = 50, authorization: str | None = Header(None)):
     return {"orders": orders}
 
 
+@app.get("/api/top-products")
+def top_products(limit: int = 5, authorization: str | None = Header(None)):
+    """Most frequently ordered products for this branch's own SWAG customer
+    — aggregated across their order history."""
+    payload = read_token(authorization)
+    orders = swag_execute(
+        "sale.order", "search_read",
+        [[["partner_id", "=", payload["swag_partner_id"]]]],
+        {"fields": ["id"], "limit": 200},
+    )
+    order_ids = [o["id"] for o in orders]
+    if not order_ids:
+        return {"products": []}
+
+    lines = swag_execute(
+        "sale.order.line", "search_read",
+        [[["order_id", "in", order_ids], ["display_type", "=", False]]],
+        {"fields": ["product_id", "product_uom_qty", "price_subtotal"]},
+    )
+    totals: dict[int, dict] = {}
+    for ln in lines:
+        pid = ln.get("product_id")
+        if not pid:
+            continue
+        entry = totals.setdefault(pid[0], {"name": pid[1], "qty": 0, "revenue": 0})
+        entry["qty"] += ln.get("product_uom_qty") or 0
+        entry["revenue"] += ln.get("price_subtotal") or 0
+
+    result = sorted(totals.values(), key=lambda t: t["qty"], reverse=True)[:limit]
+    return {"products": result}
+
+
 @app.get("/api/orders/{order_id}")
 def order_detail(order_id: int, authorization: str | None = Header(None)):
+    """Full detail (including line items) for one order in the dashboard.
+    Scoped to the logged-in branch's own SWAG customer — can't look up an
+    arbitrary order id belonging to someone else."""
     payload = read_token(authorization)
     recs = swag_execute(
         "sale.order", "read", [[order_id]],
@@ -1637,6 +1357,8 @@ def order_detail(order_id: int, authorization: str | None = Header(None)):
 
 @app.get("/api/login-history")
 def login_history(limit: int = 50, authorization: str | None = Header(None)):
+    """Every time this branch has logged in — the audit trail requested for
+    accountability, stored in our own tracking database (not Odoo)."""
     payload = read_token(authorization)
     db = database.get_session()
     try:
@@ -1664,19 +1386,19 @@ def login_history(limit: int = 50, authorization: str | None = Header(None)):
 
 @app.get("/api/order-graph")
 def order_graph(days: int = 30, authorization: str | None = Header(None)):
+    """Daily order count + value for this branch, from our own tracking
+    database (orders placed through this portal) — powers the dashboard
+    chart. This complements /api/my-orders (which reads the full, live
+    authoritative history straight from SWAG)."""
     payload = read_token(authorization)
     db = database.get_session()
     try:
-        # FIX: filter by date in the DB query — old code loaded ALL rows then
-        # sliced in Python, which is slow when a branch has many orders.
-        query = (
+        rows = (
             db.query(database.OrderRecord)
             .filter(database.OrderRecord.branch_key == payload["branch_key"])
+            .order_by(database.OrderRecord.created_at.asc())
+            .all()
         )
-        if days:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-            query = query.filter(database.OrderRecord.created_at >= cutoff)
-        rows = query.order_by(database.OrderRecord.created_at.asc()).all()
         by_day: dict[str, dict] = {}
         for r in rows:
             day = r.created_at.strftime("%Y-%m-%d")
@@ -1684,13 +1406,15 @@ def order_graph(days: int = 30, authorization: str | None = Header(None)):
             bucket["orders"] += 1
             bucket["total"] += r.amount_total or 0
         series = sorted(by_day.values(), key=lambda b: b["date"])
-        return {"series": series}
+        return {"series": series[-days:] if days else series}
     finally:
         db.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADMIN DASHBOARD
+# ADMIN DASHBOARD — separate login (shared password), combined view across
+# every branch. Reads only from our own tracking database, never touches
+# Odoo directly, so it stays fast regardless of how many branches exist.
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/api/admin/login")
 def admin_login(body: AdminLoginRequest):
@@ -1720,6 +1444,8 @@ def admin_summary(authorization: str | None = Header(None)):
 
 @app.get("/api/admin/branches")
 def admin_branches(authorization: str | None = Header(None)):
+    """Every branch that has placed at least one order, with its own totals
+    — powers the comparison table/chart."""
     read_admin_token(authorization)
     db = database.get_session()
     try:
@@ -1737,6 +1463,7 @@ def admin_branches(authorization: str | None = Header(None)):
             b["total_value"] += o.amount_total or 0
             if not b["last_order_at"] or o.created_at > b["last_order_at"]:
                 b["last_order_at"] = o.created_at
+
         result = sorted(by_branch.values(), key=lambda b: b["total_value"], reverse=True)
         for b in result:
             b["last_order_at"] = b["last_order_at"].isoformat() if b["last_order_at"] else None
@@ -1747,16 +1474,12 @@ def admin_branches(authorization: str | None = Header(None)):
 
 @app.get("/api/admin/graph")
 def admin_graph(days: int = 30, authorization: str | None = Header(None)):
+    """Daily order count + value across ALL branches combined — the overall
+    trend line for the admin dashboard."""
     read_admin_token(authorization)
     db = database.get_session()
     try:
-        # FIX: filter by date in the DB query — old code loaded ALL rows then
-        # sliced in Python, which is memory-inefficient at scale.
-        query = db.query(database.OrderRecord)
-        if days:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-            query = query.filter(database.OrderRecord.created_at >= cutoff)
-        rows = query.order_by(database.OrderRecord.created_at.asc()).all()
+        rows = db.query(database.OrderRecord).order_by(database.OrderRecord.created_at.asc()).all()
         by_day: dict[str, dict] = {}
         for r in rows:
             day = r.created_at.strftime("%Y-%m-%d")
@@ -1764,13 +1487,15 @@ def admin_graph(days: int = 30, authorization: str | None = Header(None)):
             bucket["orders"] += 1
             bucket["total"] += r.amount_total or 0
         series = sorted(by_day.values(), key=lambda b: b["date"])
-        return {"series": series}
+        return {"series": series[-days:] if days else series}
     finally:
         db.close()
 
 
 @app.get("/api/admin/orders")
 def admin_orders(limit: int = 100, authorization: str | None = Header(None)):
+    """Every order placed through the portal, across all branches — the
+    full raw list behind the summary/comparison views."""
     read_admin_token(authorization)
     db = database.get_session()
     try:
@@ -1805,8 +1530,9 @@ class ClearMappingRequest(BaseModel):
 
 @app.get("/api/admin/mappings")
 def admin_mappings(authorization: str | None = Header(None)):
-    """All branch→SWAG mappings.  Fetches all partner names in ONE batch call
-    instead of one call per mapping (was O(N) serial round-trips → O(1))."""
+    """Every branch -> SWAG customer mapping currently in effect, with the
+    best-known branch name (from login/order history) and the live SWAG
+    customer name — lets an admin spot and fix a wrong match immediately."""
     read_admin_token(authorization)
     mapping = load_branch_partner_map()
 
@@ -1818,25 +1544,19 @@ def admin_mappings(authorization: str | None = Header(None)):
     finally:
         db.close()
 
-    if not mapping:
-        return {"mappings": []}
-
-    # Batch: fetch ALL partner names in one Odoo call
-    all_partner_ids = list(mapping.values())
-    try:
-        partner_recs = swag_execute("res.partner", "read", [all_partner_ids], {"fields": ["id", "name"]})
-        name_by_partner_id = {r["id"]: r["name"] for r in (partner_recs or [])}
-    except Exception:
-        name_by_partner_id = {}
-
     result = []
     for branch_key, swag_partner_id in mapping.items():
+        swag_name = None
+        try:
+            recs = swag_execute("res.partner", "read", [[swag_partner_id]], {"fields": ["name"]})
+            swag_name = recs[0]["name"] if recs else None
+        except Exception:
+            pass
         result.append({
             "branch_key": branch_key,
             "branch_name": name_by_key.get(branch_key, "(unknown — no login recorded yet)"),
             "swag_partner_id": swag_partner_id,
-            "swag_partner_name": name_by_partner_id.get(swag_partner_id,
-                                    "(SWAG partner not found — may have been deleted)"),
+            "swag_partner_name": swag_name or "(SWAG partner not found — may have been deleted)",
         })
     result.sort(key=lambda r: r["branch_name"])
     return {"mappings": result}
@@ -1844,6 +1564,9 @@ def admin_mappings(authorization: str | None = Header(None)):
 
 @app.post("/api/admin/mappings/clear")
 def admin_clear_mapping(body: ClearMappingRequest, authorization: str | None = Header(None)):
+    """Admin-triggered version of the branch's own 'report wrong customer' —
+    clears one branch's saved mapping so its next login re-verifies from
+    scratch."""
     read_admin_token(authorization)
     mapping = load_branch_partner_map()
     if body.branch_key in mapping:
@@ -1851,17 +1574,3 @@ def admin_clear_mapping(body: ClearMappingRequest, authorization: str | None = H
         save_branch_partner_map(mapping)
     _resolved_cache.pop(body.branch_key, None)
     return {"ok": True}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CACHE MANAGEMENT (admin utility)
-# ─────────────────────────────────────────────────────────────────────────────
-@app.post("/api/admin/cache/clear")
-def admin_clear_cache(authorization: str | None = Header(None)):
-    """Flush the entire in-process cache — useful after a product import or
-    price update in Odoo without waiting for TTLs to expire."""
-    read_admin_token(authorization)
-    # FIX: use the thread-safe _cache.clear() instead of bypassing the lock
-    # by accessing _store directly (which could corrupt dict state under concurrency).
-    _cache.clear()
-    return {"ok": True, "message": "Cache cleared."}
