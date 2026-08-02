@@ -1170,23 +1170,22 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
     order_lines = []
     for item in items:
         if item.get("packaging_id"):
-            # ORDERING WITH THE PAKCING
+            # "packaging_id" here is actually a uom.uom id (an alternate unit
+            # like "P12" = 12 pieces, confirmed via SWAG's own field list —
+            # this SWAG instance has NO product.packaging model at all).
+            # Odoo interprets product_uom_qty as being IN TERMS OF whichever
+            # product_uom is set, and handles the base-unit conversion for
+            # stock itself — so product_uom_qty here is the number of BOXES,
+            # not the total pieces.
             packaging_qty = item.get("packaging_qty")
             if not packaging_qty or float(packaging_qty) <= 0:
                 packaging_qty = 1.0
             packaging_qty = float(packaging_qty)
 
-            # Total qty in base units — sent by frontend as item["qty"]
-            total_qty = float(item.get("qty") or 0)
-            if total_qty <= 0:
-                # Fallback: we don't have total qty; Odoo will compute it from packaging
-                total_qty = packaging_qty  # Odoo will fix via onchange
-
             line_vals = {
                 "product_id": item["product_id"],
-                "product_packaging_id": item["packaging_id"],
-                "product_packaging_qty": packaging_qty,
-                "product_uom_qty": total_qty,
+                "product_uom": item["packaging_id"],
+                "product_uom_qty": packaging_qty,
             }
         else:
             qty = float(item.get("qty") or 0)
@@ -1570,6 +1569,38 @@ def my_orders(limit: int = 50, authorization: str | None = Header(None)):
     for o in orders:
         o["warehouse"] = _m2o_name(o.pop("warehouse_id", None))
     return {"orders": orders}
+
+
+@app.get("/api/top-products")
+def top_products(limit: int = 5, authorization: str | None = Header(None)):
+    """Most frequently ordered products for this branch's own SWAG customer
+    — aggregated across their order history."""
+    payload = read_token(authorization)
+    orders = swag_execute(
+        "sale.order", "search_read",
+        [[["partner_id", "=", payload["swag_partner_id"]]]],
+        {"fields": ["id"], "limit": 200},
+    )
+    order_ids = [o["id"] for o in orders]
+    if not order_ids:
+        return {"products": []}
+
+    lines = swag_execute(
+        "sale.order.line", "search_read",
+        [[["order_id", "in", order_ids], ["display_type", "=", False]]],
+        {"fields": ["product_id", "product_uom_qty", "price_subtotal"]},
+    )
+    totals: dict[int, dict] = {}
+    for ln in lines:
+        pid = ln.get("product_id")
+        if not pid:
+            continue
+        entry = totals.setdefault(pid[0], {"name": pid[1], "qty": 0, "revenue": 0})
+        entry["qty"] += ln.get("product_uom_qty") or 0
+        entry["revenue"] += ln.get("price_subtotal") or 0
+
+    result = sorted(totals.values(), key=lambda t: t["qty"], reverse=True)[:limit]
+    return {"products": result}
 
 
 @app.get("/api/orders/{order_id}")
