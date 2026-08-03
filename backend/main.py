@@ -1127,19 +1127,14 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
 
     order_lines = []
     for item in items:
-        if item.get("packaging_id"):
-            # "packaging_id" here is actually a uom.uom id (an alternate unit
-            # like "P48" = 48 pieces) and "packaging_qty" is the number of
-            # those units (boxes) — Odoo interprets product_uom_qty in terms
-            # of whichever product_uom is set, and handles the pieces
-            # conversion itself.
-            line_vals = {
-                "product_id": item["product_id"],
-                "product_uom_id": item["packaging_id"],
-                "product_uom_qty": item.get("packaging_qty") or 1,
-            }
-        else:
-            line_vals = {"product_id": item["product_id"], "product_uom_qty": item["qty"]}
+        # "qty" is always the TOTAL PIECES (already computed from box-count ×
+        # pack-size on the frontend when packaging was used) — we deliberately
+        # do NOT set product_uom_id to the box unit here. Setting it would
+        # make Odoo display "Quantity: 1, Unit: P12" (technically correct —
+        # 1 box of 12 — but confusing at a glance), so instead we record the
+        # line in the product's normal base unit, showing "Quantity: 12"
+        # directly, matching what branches expect to see.
+        line_vals = {"product_id": item["product_id"], "product_uom_qty": item["qty"]}
         if line_warehouse_field:
             line_vals[line_warehouse_field] = warehouse_id
         order_lines.append((0, 0, line_vals))
@@ -1183,24 +1178,6 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
             line_ids = swag_execute("sale.order.line", "search", [[["order_id", "=", order_id]]])
             if line_ids:
                 swag_execute("sale.order.line", "write", [line_ids, {line_warehouse_field: warehouse_id}])
-        except Exception:
-            pass  # non-critical — order still gets created either way
-
-    # Odoo resets a line's product_uom back to the product's base unit after
-    # create() (same computed-field-overrides-our-value pattern as
-    # warehouse_id/salesperson above) — force the chosen packaging (box) unit
-    # and quantity to stick, one line at a time, in the same order we sent them.
-    if any(item.get("packaging_id") for item in items):
-        try:
-            line_ids_ordered = swag_execute(
-                "sale.order.line", "search", [[["order_id", "=", order_id]]], {"order": "id asc"}
-            )
-            for line_id, item in zip(line_ids_ordered, items):
-                if item.get("packaging_id"):
-                    swag_execute("sale.order.line", "write", [[line_id], {
-                        "product_uom_id": item["packaging_id"],
-                        "product_uom_qty": item.get("packaging_qty") or 1,
-                    }])
         except Exception:
             pass  # non-critical — order still gets created either way
 
