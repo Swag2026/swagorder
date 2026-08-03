@@ -1155,6 +1155,7 @@ def create_order(body: OrderRequest, authorization: str | None = Header(None)):
         {"product_id": it.product_id, "qty": it.qty, "packaging_id": it.packaging_id, "packaging_qty": it.packaging_qty}
         for it in body.items
     ]
+    verify_stock_before_order(items, body.warehouse_id, payload["branch_key"])
     order_id, details = _create_swag_order(
         payload["swag_partner_id"], items, body.warehouse_id, body.note,
         employee_name, payload.get("branch_name"), payload["branch_key"],
@@ -1274,6 +1275,7 @@ def approve_pending_order(pending_id: int, body: DecidePendingRequest, authoriza
             }
             for i in items
         ]
+        verify_stock_before_order(order_items, row.warehouse_id, row.branch_key)
         order_id, details = _create_swag_order(
             row.swag_partner_id, order_items, row.warehouse_id, row.note,
             row.requested_by, row.branch_name, row.branch_key,
@@ -1712,6 +1714,48 @@ def reserved_by_others(product_id: int, warehouse_id: int, own_branch_key: str) 
         return sum(r.qty for r in rows)
     finally:
         db.close()
+
+
+def get_available_stock(product_id: int, warehouse_id: int, own_branch_key: str) -> float:
+    """Fresh SWAG stock for this product in this warehouse, minus whatever
+    other branches currently have reserved."""
+    quants = swag_execute(
+        "stock.quant", "search_read",
+        [[["product_id", "=", product_id], ["location_id.usage", "=", "internal"], ["quantity", "!=", 0]]],
+        {"fields": ["location_id", "quantity"]},
+    )
+    if not quants:
+        return 0.0
+    location_ids = list({q["location_id"][0] for q in quants if q.get("location_id")})
+    locations = swag_execute("stock.location", "read", [location_ids], {"fields": ["warehouse_id"]})
+    loc_to_wh = {loc["id"]: (loc["warehouse_id"][0] if loc.get("warehouse_id") else None) for loc in locations}
+    total = 0.0
+    for q in quants:
+        loc = q.get("location_id")
+        if loc and loc_to_wh.get(loc[0]) == warehouse_id:
+            total += q["quantity"]
+    return max(0.0, total - reserved_by_others(product_id, warehouse_id, own_branch_key))
+
+
+def verify_stock_before_order(items: list[dict], warehouse_id: int | None, branch_key: str):
+    """Last-second re-check right before actually creating an order — stock
+    shown a few minutes ago in the catalog may have moved on. Raises a clear
+    409 error naming exactly which product(s) fell short, instead of letting
+    SWAG silently oversell."""
+    if not warehouse_id:
+        return  # no specific warehouse chosen — nothing to verify against
+    shortfalls = []
+    for item in items:
+        available = get_available_stock(item["product_id"], warehouse_id, branch_key)
+        needed = item["qty"]
+        if needed > available:
+            shortfalls.append(f"product #{item['product_id']} (need {needed}, only {available} left)")
+    if shortfalls:
+        raise HTTPException(
+            409,
+            "Stock changed since you added these items — " + "; ".join(shortfalls) +
+            ". Please adjust your cart and try again.",
+        )
 
 
 @app.post("/api/reservations")
