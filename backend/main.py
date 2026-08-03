@@ -784,7 +784,7 @@ def report_wrong_customer(authorization: str | None = Header(None)):
 
 
 @app.get("/api/products")
-def search_products(q: str = "", limit: int = 40, authorization: str | None = Header(None)):
+def search_products(q: str = "", limit: int = 20, authorization: str | None = Header(None)):
     read_token(authorization)
     domain = [["sale_ok", "=", True]]
     q = (q or "").strip()
@@ -804,6 +804,100 @@ def product_image(product_id: int, authorization: str | None = Header(None)):
     recs = swag_execute("product.product", "read", [[product_id]], {"fields": ["image_128"]})
     image_b64 = recs[0].get("image_128") if recs else None
     return {"image_base64": image_b64}
+
+
+@app.get("/api/products/{product_id}/details")
+def product_details_combined(product_id: int, authorization: str | None = Header(None)):
+    """Combines stock-by-warehouse + packagings + my-shop-stock into ONE
+    request — used by the catalog so each product card needs a single
+    round-trip instead of three, which is what was making search feel slow."""
+    payload = read_token(authorization)
+
+    # --- stock by warehouse ---
+    quants = swag_execute(
+        "stock.quant", "search_read",
+        [[["product_id", "=", product_id], ["location_id.usage", "=", "internal"], ["quantity", "!=", 0]]],
+        {"fields": ["location_id", "quantity"]},
+    )
+    stock_by_warehouse = []
+    if quants:
+        location_ids = list({q["location_id"][0] for q in quants if q.get("location_id")})
+        locations = swag_execute("stock.location", "read", [location_ids], {"fields": ["warehouse_id"]})
+        loc_to_wh = {loc["id"]: loc.get("warehouse_id") for loc in locations}
+        totals: dict[tuple, float] = {}
+        for q in quants:
+            loc = q.get("location_id")
+            if not loc:
+                continue
+            wh = loc_to_wh.get(loc[0])
+            key = (wh[0], wh[1]) if wh else (None, "Other / Unassigned")
+            totals[key] = totals.get(key, 0) + q["quantity"]
+        stock_by_warehouse = [
+            {"warehouse_id": wh_id, "warehouse_name": wh_name, "quantity": qty}
+            for (wh_id, wh_name), qty in totals.items() if qty
+        ]
+        # Subtract what other branches currently have reserved in their carts,
+        # so this branch doesn't try to order stock someone else is mid-way
+        # through claiming.
+        for row in stock_by_warehouse:
+            if row["warehouse_id"]:
+                held = reserved_by_others(product_id, row["warehouse_id"], payload["branch_key"])
+                row["quantity"] = max(0, row["quantity"] - held)
+                row["held_by_others"] = held
+
+    # --- packagings (uom_ids) ---
+    prod = swag_execute("product.product", "read", [[product_id]],
+                         {"fields": ["uom_id", "uom_ids", "default_code"]})
+    packagings = []
+    if prod:
+        base_uom = prod[0].get("uom_id") or False
+        base_uom_id = base_uom[0] if base_uom else None
+        alt_uom_ids = [uid for uid in (prod[0].get("uom_ids") or []) if uid != base_uom_id]
+        if alt_uom_ids:
+            uoms = None
+            for qty_field in ("factor_inv", "factor", "ratio"):
+                try:
+                    raw = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name", qty_field]})
+                    uoms = [{"id": u["id"], "name": u["name"], "qty": u[qty_field]} for u in raw]
+                    break
+                except Exception:
+                    uoms = None
+            if uoms is None:
+                raw = swag_execute("uom.uom", "read", [alt_uom_ids], {"fields": ["name"]})
+                uoms = [{"id": u["id"], "name": u["name"], "qty": None} for u in raw]
+            uoms.sort(key=lambda p: (p["qty"] is None, p["qty"]))
+            packagings = uoms
+
+    # --- my-shop-stock (LAROUCHE) ---
+    shop_stock = {"matched": False, "quantity": None, "reason": "This product has no code to match by."}
+    code = prod[0].get("default_code") if prod else None
+    if code:
+        laroche_products = laroche_admin_execute(
+            "product.product", "search_read", [[["default_code", "=", code]]], {"fields": ["id", "name"]}
+        )
+        if len(laroche_products) == 1:
+            lc_id = laroche_products[0]["id"]
+            wh_id = int(payload["branch_key"])
+            lc_quants = laroche_admin_execute(
+                "stock.quant", "search_read",
+                [[["product_id", "=", lc_id], ["location_id.usage", "=", "internal"], ["quantity", "!=", 0]]],
+                {"fields": ["location_id", "quantity"]},
+            )
+            total = 0.0
+            if lc_quants:
+                lc_loc_ids = list({q["location_id"][0] for q in lc_quants if q.get("location_id")})
+                lc_locs = laroche_admin_execute("stock.location", "read", [lc_loc_ids], {"fields": ["warehouse_id"]})
+                lc_loc_to_wh = {loc["id"]: (loc["warehouse_id"][0] if loc.get("warehouse_id") else None) for loc in lc_locs}
+                for q in lc_quants:
+                    loc = q.get("location_id")
+                    if loc and lc_loc_to_wh.get(loc[0]) == wh_id:
+                        total += q["quantity"]
+            shop_stock = {"matched": True, "quantity": total, "laroche_product_name": laroche_products[0]["name"]}
+        else:
+            reason = "not found in LAROUCHE" if not laroche_products else "multiple LAROUCHE products share this code"
+            shop_stock = {"matched": False, "quantity": None, "reason": reason}
+
+    return {"stock_by_warehouse": stock_by_warehouse, "packagings": packagings, "shop_stock": shop_stock}
 
 
 @app.get("/api/products/{product_id}/stock")
@@ -1582,3 +1676,92 @@ def admin_clear_mapping(body: ClearMappingRequest, authorization: str | None = H
         save_branch_partner_map(mapping)
     _resolved_cache.pop(body.branch_key, None)
     return {"ok": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STOCK RESERVATIONS — a short hold while an item sits in someone's cart, so
+# two branches don't both try to order the last few pieces of the same
+# product from the same warehouse at the same time.
+# ─────────────────────────────────────────────────────────────────────────────
+RESERVATION_TTL_MINUTES = 15
+
+
+class ReserveRequest(BaseModel):
+    product_id: int
+    warehouse_id: int
+    qty: float
+
+
+def reserved_by_others(product_id: int, warehouse_id: int, own_branch_key: str) -> float:
+    """Total quantity other branches currently have reserved (not expired)
+    for this exact product+warehouse — subtract this from raw SWAG stock
+    before showing/allowing an order."""
+    db = database.get_session()
+    try:
+        now = datetime.now(timezone.utc)
+        rows = (
+            db.query(database.StockReservation)
+            .filter(
+                database.StockReservation.product_id == product_id,
+                database.StockReservation.warehouse_id == warehouse_id,
+                database.StockReservation.branch_key != own_branch_key,
+                database.StockReservation.expires_at > now,
+            )
+            .all()
+        )
+        return sum(r.qty for r in rows)
+    finally:
+        db.close()
+
+
+@app.post("/api/reservations")
+def upsert_reservation(body: ReserveRequest, authorization: str | None = Header(None)):
+    """Called when a branch adds/updates a cart line — holds that quantity
+    for RESERVATION_TTL_MINUTES, refreshing the timer each time the qty
+    changes so an active cart never expires mid-edit."""
+    payload = read_token(authorization)
+    branch_key = payload["branch_key"]
+    db = database.get_session()
+    try:
+        row = (
+            db.query(database.StockReservation)
+            .filter(
+                database.StockReservation.product_id == body.product_id,
+                database.StockReservation.warehouse_id == body.warehouse_id,
+                database.StockReservation.branch_key == branch_key,
+            )
+            .first()
+        )
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=RESERVATION_TTL_MINUTES)
+        if row:
+            row.qty = body.qty
+            row.expires_at = expires_at
+        else:
+            db.add(database.StockReservation(
+                product_id=body.product_id, warehouse_id=body.warehouse_id,
+                branch_key=branch_key, qty=body.qty, expires_at=expires_at,
+            ))
+        db.commit()
+        return {"ok": True, "expires_in_minutes": RESERVATION_TTL_MINUTES}
+    finally:
+        db.close()
+
+
+@app.delete("/api/reservations/{product_id}/{warehouse_id}")
+def release_reservation(product_id: int, warehouse_id: int, authorization: str | None = Header(None)):
+    """Called when a branch removes an item from their cart, or right after
+    successfully submitting an order (the real SWAG stock now reflects it,
+    so the temporary hold is no longer needed)."""
+    payload = read_token(authorization)
+    branch_key = payload["branch_key"]
+    db = database.get_session()
+    try:
+        db.query(database.StockReservation).filter(
+            database.StockReservation.product_id == product_id,
+            database.StockReservation.warehouse_id == warehouse_id,
+            database.StockReservation.branch_key == branch_key,
+        ).delete()
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
