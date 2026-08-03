@@ -1186,6 +1186,24 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
         except Exception:
             pass  # non-critical — order still gets created either way
 
+    # Odoo resets a line's product_uom back to the product's base unit after
+    # create() (same computed-field-overrides-our-value pattern as
+    # warehouse_id/salesperson above) — force the chosen packaging (box) unit
+    # and quantity to stick, one line at a time, in the same order we sent them.
+    if any(item.get("packaging_id") for item in items):
+        try:
+            line_ids_ordered = swag_execute(
+                "sale.order.line", "search", [[["order_id", "=", order_id]]], {"order": "id asc"}
+            )
+            for line_id, item in zip(line_ids_ordered, items):
+                if item.get("packaging_id"):
+                    swag_execute("sale.order.line", "write", [[line_id], {
+                        "product_uom_id": item["packaging_id"],
+                        "product_uom_qty": item.get("packaging_qty") or 1,
+                    }])
+        except Exception:
+            pass  # non-critical — order still gets created either way
+
     detail_fields = [
         "name", "partner_id", "partner_invoice_id", "partner_shipping_id",
         "pricelist_id", "payment_term_id", "user_id", "date_order",
