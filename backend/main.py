@@ -784,7 +784,7 @@ def report_wrong_customer(authorization: str | None = Header(None)):
 
 
 @app.get("/api/products")
-def search_products(q: str = "", limit: int = 20, authorization: str | None = Header(None)):
+def search_products(q: str = "", limit: int = 10, authorization: str | None = Header(None)):
     read_token(authorization)
     domain = [["sale_ok", "=", True]]
     q = (q or "").strip()
@@ -898,6 +898,96 @@ def product_details_combined(product_id: int, authorization: str | None = Header
             shop_stock = {"matched": False, "quantity": None, "reason": reason}
 
     return {"stock_by_warehouse": stock_by_warehouse, "packagings": packagings, "shop_stock": shop_stock}
+
+
+def laroche_shop_stock_for(swag_product_id: int, warehouse_id: int):
+    """Same lookup as /api/products/{id}/my-shop-stock, but for an arbitrary
+    branch's warehouse_id (used by the admin dashboard to compare any
+    branch's own stock against what they ordered)."""
+    recs = swag_execute("product.product", "read", [[swag_product_id]], {"fields": ["default_code"]})
+    code = recs[0].get("default_code") if recs else None
+    if not code:
+        return {"matched": False, "quantity": None, "reason": "This product has no code to match by."}
+
+    laroche_products = laroche_admin_execute(
+        "product.product", "search_read", [[["default_code", "=", code]]], {"fields": ["id", "name"]}
+    )
+    if len(laroche_products) != 1:
+        reason = "not found in LAROUCHE" if not laroche_products else "multiple LAROUCHE products share this code"
+        return {"matched": False, "quantity": None, "reason": reason}
+    lc_id = laroche_products[0]["id"]
+
+    quants = laroche_admin_execute(
+        "stock.quant", "search_read",
+        [[["product_id", "=", lc_id], ["location_id.usage", "=", "internal"], ["quantity", "!=", 0]]],
+        {"fields": ["location_id", "quantity"]},
+    )
+    total = 0.0
+    if quants:
+        loc_ids = list({q["location_id"][0] for q in quants if q.get("location_id")})
+        locs = laroche_admin_execute("stock.location", "read", [loc_ids], {"fields": ["warehouse_id"]})
+        loc_to_wh = {loc["id"]: (loc["warehouse_id"][0] if loc.get("warehouse_id") else None) for loc in locs}
+        for q in quants:
+            loc = q.get("location_id")
+            if loc and loc_to_wh.get(loc[0]) == warehouse_id:
+                total += q["quantity"]
+    return {"matched": True, "quantity": total, "laroche_product_name": laroche_products[0]["name"]}
+
+
+@app.get("/api/admin/orders/{record_id}/detail")
+def admin_order_detail(record_id: int, authorization: str | None = Header(None)):
+    """Full detail for one order in the admin dashboard — every line item,
+    plus (as a comparison) how much of that same product the ordering
+    branch already has in its own shop right now."""
+    read_admin_token(authorization)
+    db = database.get_session()
+    try:
+        row = db.query(database.OrderRecord).filter(database.OrderRecord.id == record_id).first()
+        if not row:
+            raise HTTPException(404, "Order record not found.")
+        items = json.loads(row.items_json)
+    finally:
+        db.close()
+
+    branch_warehouse_id = int(row.branch_key) if row.branch_key and row.branch_key.isdigit() else None
+
+    lines = []
+    for it in items:
+        product_id = it.get("product_id")
+        prod = swag_execute("product.product", "read", [[product_id]],
+                             {"fields": ["default_code", "name", "list_price"]}) if product_id else []
+        pname = prod[0]["name"] if prod else f"Product #{product_id}"
+        pcode = prod[0].get("default_code") if prod else None
+        price = prod[0].get("list_price") if prod else 0
+        qty = it.get("qty", 0)
+
+        branch_stock = None
+        if branch_warehouse_id and product_id:
+            try:
+                branch_stock = laroche_shop_stock_for(product_id, branch_warehouse_id)
+            except Exception:
+                branch_stock = {"matched": False, "quantity": None, "reason": "lookup failed"}
+
+        lines.append({
+            "product_id": product_id,
+            "default_code": pcode,
+            "name": pname,
+            "qty_ordered": qty,
+            "price": price,
+            "subtotal": qty * (price or 0),
+            "branch_current_stock": branch_stock,
+        })
+
+    return {
+        "id": row.id,
+        "swag_order_name": row.swag_order_name,
+        "branch_name": row.branch_name,
+        "employee_name": row.employee_name,
+        "warehouse_name": row.warehouse_name,
+        "amount_total": row.amount_total,
+        "created_at": row.created_at.isoformat(),
+        "lines": lines,
+    }
 
 
 @app.get("/api/products/{product_id}/stock")
@@ -1569,11 +1659,59 @@ def admin_branches(authorization: str | None = Header(None)):
                 b["last_order_at"] = o.created_at
 
         result = sorted(by_branch.values(), key=lambda b: b["total_value"], reverse=True)
+        now = datetime.now(timezone.utc)
         for b in result:
-            b["last_order_at"] = b["last_order_at"].isoformat() if b["last_order_at"] else None
+            last = b["last_order_at"]
+            days_since = None
+            if last:
+                last_cmp = last if last.tzinfo else last.replace(tzinfo=timezone.utc)
+                days_since = (now - last_cmp).days
+            b["days_since_last_order"] = days_since
+            b["is_inactive"] = days_since is not None and days_since >= 10
+            b["last_order_at"] = last.isoformat() if last else None
         return {"branches": result}
     finally:
         db.close()
+
+
+@app.get("/api/admin/top-products")
+def admin_top_products(limit: int = 15, authorization: str | None = Header(None)):
+    """Which products get ordered the most, across ALL branches combined —
+    aggregated from every order's stored line items."""
+    read_admin_token(authorization)
+    db = database.get_session()
+    try:
+        orders = db.query(database.OrderRecord).all()
+    finally:
+        db.close()
+
+    totals: dict[int, dict] = {}
+    for o in orders:
+        try:
+            items = json.loads(o.items_json or "[]")
+        except Exception:
+            continue
+        for it in items:
+            pid = it.get("product_id")
+            if not pid:
+                continue
+            bucket = totals.setdefault(pid, {"product_id": pid, "qty_ordered": 0.0, "order_count": 0})
+            bucket["qty_ordered"] += it.get("qty", 0) or 0
+            bucket["order_count"] += 1
+
+    top = sorted(totals.values(), key=lambda b: b["qty_ordered"], reverse=True)[:limit]
+
+    for row in top:
+        try:
+            recs = swag_execute("product.product", "read", [[row["product_id"]]],
+                                 {"fields": ["default_code", "name"]})
+            row["default_code"] = recs[0].get("default_code") if recs else None
+            row["name"] = recs[0].get("name") if recs else f"Product #{row['product_id']}"
+        except Exception:
+            row["default_code"] = None
+            row["name"] = f"Product #{row['product_id']}"
+
+    return {"products": top}
 
 
 @app.get("/api/admin/graph")
