@@ -68,6 +68,22 @@ class OrderRecord(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
 
+class StockReservation(Base):
+    """A short-lived hold on stock while a product sits in someone's cart —
+    so a second branch searching the same product sees it as (partly)
+    unavailable instead of both branches racing for the same last pieces.
+    Expires automatically; converted orders/removed cart items delete it."""
+    __tablename__ = "stock_reservations"
+
+    id = Column(Integer, primary_key=True)
+    product_id = Column(Integer, index=True)
+    warehouse_id = Column(Integer, index=True)
+    branch_key = Column(String, index=True)
+    qty = Column(Float)
+    expires_at = Column(DateTime, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class PendingOrder(Base):
     """An order a staff member submitted for manager approval — sits here
     until someone at the branch approves (creating the real SWAG order) or
