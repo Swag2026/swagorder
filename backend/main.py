@@ -806,6 +806,152 @@ def product_image(product_id: int, authorization: str | None = Header(None)):
     return {"image_base64": image_b64}
 
 
+class BatchDetailsRequest(BaseModel):
+    product_ids: list[int]
+
+
+@app.post("/api/products/batch-details")
+def product_batch_details(body: BatchDetailsRequest, authorization: str | None = Header(None)):
+    """Same data as /api/products/{id}/details, but for MANY products in one
+    shot — a handful of Odoo queries total instead of one full set per
+    product. This is what the catalog uses for search results now, since
+    fetching 10 products individually was the main thing making search feel
+    slow."""
+    payload = read_token(authorization)
+    product_ids = body.product_ids
+    if not product_ids:
+        return {"results": {}}
+
+    results = {pid: {"stock_by_warehouse": [], "packagings": [], "shop_stock": None} for pid in product_ids}
+
+    # ---- SWAG stock, batched across all products ----
+    quants = swag_execute(
+        "stock.quant", "search_read",
+        [[["product_id", "in", product_ids], ["location_id.usage", "=", "internal"], ["quantity", "!=", 0]]],
+        {"fields": ["product_id", "location_id", "quantity"]},
+    )
+    if quants:
+        location_ids = list({q["location_id"][0] for q in quants if q.get("location_id")})
+        locations = swag_execute("stock.location", "read", [location_ids], {"fields": ["warehouse_id"]})
+        loc_to_wh = {loc["id"]: loc.get("warehouse_id") for loc in locations}
+        totals: dict[tuple, float] = {}
+        for q in quants:
+            pid = q["product_id"][0] if q.get("product_id") else None
+            loc = q.get("location_id")
+            if pid is None or not loc:
+                continue
+            wh = loc_to_wh.get(loc[0])
+            key = (pid, wh[0] if wh else None, wh[1] if wh else "Other / Unassigned")
+            totals[key] = totals.get(key, 0) + q["quantity"]
+        by_product: dict[int, list] = {}
+        for (pid, wh_id, wh_name), qty in totals.items():
+            if not qty:
+                continue
+            by_product.setdefault(pid, []).append({"warehouse_id": wh_id, "warehouse_name": wh_name, "quantity": qty})
+        for pid, rows in by_product.items():
+            for row in rows:
+                if row["warehouse_id"]:
+                    held = reserved_by_others(pid, row["warehouse_id"], payload["branch_key"])
+                    row["quantity"] = max(0, row["quantity"] - held)
+            if pid in results:
+                results[pid]["stock_by_warehouse"] = rows
+
+    # ---- Product info (base uom + alt uoms + default_code), batched ----
+    prods = swag_execute("product.product", "read", [product_ids], {"fields": ["uom_id", "uom_ids", "default_code"]})
+    prod_by_id = {p["id"]: p for p in prods}
+
+    all_alt_uom_ids: set[int] = set()
+    for pid, p in prod_by_id.items():
+        base_uom_id = p["uom_id"][0] if p.get("uom_id") else None
+        for uid in (p.get("uom_ids") or []):
+            if uid != base_uom_id:
+                all_alt_uom_ids.add(uid)
+
+    uom_qty_by_id: dict[int, float | None] = {}
+    uom_name_by_id: dict[int, str] = {}
+    if all_alt_uom_ids:
+        uom_list = list(all_alt_uom_ids)
+        found = False
+        for qty_field in ("factor_inv", "factor", "ratio"):
+            try:
+                raw = swag_execute("uom.uom", "read", [uom_list], {"fields": ["name", qty_field]})
+                for u in raw:
+                    uom_name_by_id[u["id"]] = u["name"]
+                    uom_qty_by_id[u["id"]] = u[qty_field]
+                found = True
+                break
+            except Exception:
+                continue
+        if not found:
+            raw = swag_execute("uom.uom", "read", [uom_list], {"fields": ["name"]})
+            for u in raw:
+                uom_name_by_id[u["id"]] = u["name"]
+                uom_qty_by_id[u["id"]] = None
+
+    for pid, p in prod_by_id.items():
+        if pid not in results:
+            continue
+        base_uom_id = p["uom_id"][0] if p.get("uom_id") else None
+        alt_ids = [uid for uid in (p.get("uom_ids") or []) if uid != base_uom_id]
+        pkgs = [{"id": uid, "name": uom_name_by_id.get(uid), "qty": uom_qty_by_id.get(uid)} for uid in alt_ids]
+        pkgs.sort(key=lambda x: (x["qty"] is None, x["qty"]))
+        results[pid]["packagings"] = pkgs
+
+    # ---- LAROUCHE shop stock, batched by default_code ----
+    codes = [prod_by_id[pid].get("default_code") for pid in product_ids if pid in prod_by_id and prod_by_id[pid].get("default_code")]
+    code_to_pid = {prod_by_id[pid]["default_code"]: pid for pid in product_ids if pid in prod_by_id and prod_by_id[pid].get("default_code")}
+    if codes:
+        lc_products = laroche_admin_execute(
+            "product.product", "search_read", [[["default_code", "in", codes]]], {"fields": ["id", "default_code", "name"]}
+        )
+        # Guard against a code matching more than one LAROUCHE product — same
+        # "don't guess" rule as the single-product version.
+        by_code: dict[str, list] = {}
+        for lp in lc_products:
+            by_code.setdefault(lp["default_code"], []).append(lp)
+
+        matched_lc_ids = []
+        lc_id_to_pid = {}
+        for code, lps in by_code.items():
+            pid = code_to_pid.get(code)
+            if pid is None:
+                continue
+            if len(lps) == 1:
+                matched_lc_ids.append(lps[0]["id"])
+                lc_id_to_pid[lps[0]["id"]] = pid
+                results[pid]["shop_stock"] = {"matched": True, "quantity": 0.0, "laroche_product_name": lps[0]["name"]}
+            else:
+                results[pid]["shop_stock"] = {"matched": False, "quantity": None, "reason": "multiple LAROUCHE products share this code"}
+        for code in codes:
+            if code not in by_code:
+                pid = code_to_pid.get(code)
+                if pid is not None:
+                    results[pid]["shop_stock"] = {"matched": False, "quantity": None, "reason": "not found in LAROUCHE"}
+
+        if matched_lc_ids:
+            warehouse_id = int(payload["branch_key"])
+            lc_quants = laroche_admin_execute(
+                "stock.quant", "search_read",
+                [[["product_id", "in", matched_lc_ids], ["location_id.usage", "=", "internal"], ["quantity", "!=", 0]]],
+                {"fields": ["product_id", "location_id", "quantity"]},
+            )
+            if lc_quants:
+                lc_loc_ids = list({q["location_id"][0] for q in lc_quants if q.get("location_id")})
+                lc_locs = laroche_admin_execute("stock.location", "read", [lc_loc_ids], {"fields": ["warehouse_id"]})
+                lc_loc_to_wh = {loc["id"]: (loc["warehouse_id"][0] if loc.get("warehouse_id") else None) for loc in lc_locs}
+                for q in lc_quants:
+                    lc_pid = q["product_id"][0] if q.get("product_id") else None
+                    loc = q.get("location_id")
+                    if lc_pid is None or not loc:
+                        continue
+                    if lc_loc_to_wh.get(loc[0]) == warehouse_id:
+                        pid = lc_id_to_pid.get(lc_pid)
+                        if pid is not None:
+                            results[pid]["shop_stock"]["quantity"] += q["quantity"]
+
+    return {"results": results}
+
+
 @app.get("/api/products/{product_id}/details")
 def product_details_combined(product_id: int, authorization: str | None = Header(None)):
     """Combines stock-by-warehouse + packagings + my-shop-stock into ONE
@@ -1667,6 +1813,77 @@ def admin_branches(authorization: str | None = Header(None)):
         return {"branches": result}
     finally:
         db.close()
+
+
+@app.get("/api/admin/branches/{branch_key}/detail")
+def admin_branch_detail(branch_key: str, authorization: str | None = Header(None)):
+    """Everything about ONE specific branch — its own order history, login
+    history, and its own most-ordered products — for the admin drill-down."""
+    read_admin_token(authorization)
+    db = database.get_session()
+    try:
+        order_rows = (
+            db.query(database.OrderRecord)
+            .filter(database.OrderRecord.branch_key == branch_key)
+            .order_by(database.OrderRecord.created_at.desc())
+            .all()
+        )
+        login_rows = (
+            db.query(database.LoginEvent)
+            .filter(database.LoginEvent.branch_key == branch_key)
+            .order_by(database.LoginEvent.created_at.desc())
+            .limit(20)
+            .all()
+        )
+    finally:
+        db.close()
+
+    branch_name = order_rows[0].branch_name if order_rows else (login_rows[0].branch_name if login_rows else branch_key)
+
+    # This branch's own top products, from its own order history only.
+    totals: dict[int, dict] = {}
+    for o in order_rows:
+        try:
+            items = json.loads(o.items_json or "[]")
+        except Exception:
+            continue
+        for it in items:
+            pid = it.get("product_id")
+            if not pid:
+                continue
+            bucket = totals.setdefault(pid, {"product_id": pid, "qty_ordered": 0.0, "order_count": 0})
+            bucket["qty_ordered"] += it.get("qty", 0) or 0
+            bucket["order_count"] += 1
+    top_products = sorted(totals.values(), key=lambda b: b["qty_ordered"], reverse=True)[:10]
+    for row in top_products:
+        try:
+            recs = swag_execute("product.product", "read", [[row["product_id"]]], {"fields": ["default_code", "name"]})
+            row["default_code"] = recs[0].get("default_code") if recs else None
+            row["name"] = recs[0].get("name") if recs else f"Product #{row['product_id']}"
+        except Exception:
+            row["default_code"] = None
+            row["name"] = f"Product #{row['product_id']}"
+
+    return {
+        "branch_key": branch_key,
+        "branch_name": branch_name,
+        "orders": [
+            {
+                "id": o.id,
+                "swag_order_name": o.swag_order_name,
+                "employee_name": o.employee_name,
+                "warehouse_name": o.warehouse_name,
+                "item_count": o.item_count,
+                "created_at": o.created_at.isoformat(),
+            }
+            for o in order_rows
+        ],
+        "logins": [
+            {"employee_name": r.employee_name, "created_at": r.created_at.isoformat()}
+            for r in login_rows
+        ],
+        "top_products": top_products,
+    }
 
 
 @app.get("/api/admin/top-products")
