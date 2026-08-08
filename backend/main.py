@@ -318,7 +318,7 @@ def _norm(s: str | None) -> str:
 
 _GENERIC_NAME_WORDS = {
     "شركة", "التجارية", "فرع", "فروع", "مؤسسة", "المحدودة", "مجموعة", "متجر", "معرض",
-    "مستودع", "للأزياء", "التجاري", "مصنع", "محل", "مكتب", "co", "company", "trading",
+    "مستودع", "سوق", "للأزياء", "التجاري", "مصنع", "محل", "مكتب", "co", "company", "trading",
     "branch", "store", "shop", "warehouse", "ltd", "llc", "est", "establishment",
 }
 
