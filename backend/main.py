@@ -1757,16 +1757,36 @@ def bulk_lookup_products(body: BulkLookupRequest, authorization: str | None = He
 
 @app.get("/api/products/by-barcode")
 def product_by_barcode(code: str, authorization: str | None = Header(None)):
-    """Used by the barcode scanner — look up a product by its exact barcode."""
+    """Used by the barcode scanner — look up a product by its barcode.
+    Tries an exact match first (fast, precise), then falls back to
+    leading-zero variants and a partial match — some scanners/labels differ
+    slightly in exactly how the digits are formatted."""
     read_token(authorization)
     code = (code or "").strip()
     if not code:
         raise HTTPException(400, "No barcode provided.")
-    recs = swag_execute(
-        "product.product", "search_read",
-        [[["barcode", "=", code]]],
-        {"fields": ["id", "default_code", "name", "list_price", "qty_available"]},
-    )
+
+    fields = ["id", "default_code", "name", "list_price", "qty_available"]
+
+    recs = swag_execute("product.product", "search_read", [[["barcode", "=", code]]], {"fields": fields})
+
+    if not recs:
+        # Try with/without a leading zero — a common source of mismatch
+        # between what a scanner outputs and what's stored.
+        variants = {code.lstrip("0"), "0" + code}
+        variants.discard(code)
+        for variant in variants:
+            if not variant:
+                continue
+            recs = swag_execute("product.product", "search_read", [[["barcode", "=", variant]]], {"fields": fields})
+            if recs:
+                break
+
+    if not recs:
+        # Last resort: partial match, in case of stray characters/whitespace
+        # baked into the stored barcode value.
+        recs = swag_execute("product.product", "search_read", [[["barcode", "ilike", code]]], {"fields": fields})
+
     if not recs:
         raise HTTPException(404, f"No product found with barcode {code}.")
     if len(recs) > 1:
