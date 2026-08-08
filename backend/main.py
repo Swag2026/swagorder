@@ -318,7 +318,7 @@ def _norm(s: str | None) -> str:
 
 _GENERIC_NAME_WORDS = {
     "شركة", "التجارية", "فرع", "فروع", "مؤسسة", "المحدودة", "مجموعة", "متجر", "معرض",
-    "مستودع", "سوق", "للأزياء", "التجاري", "مصنع", "محل", "مكتب", "co", "company", "trading",
+    "مستودع", "للأزياء", "التجاري", "مصنع", "محل", "مكتب", "co", "company", "trading",
     "branch", "store", "shop", "warehouse", "ltd", "llc", "est", "establishment",
 }
 
@@ -410,30 +410,20 @@ def auto_resolve_swag_partner(branch_info: dict):
 def find_branch_partner_candidates(branch_info: dict) -> list[dict]:
     """Find review candidates from the outlet name only.
 
-    Tries keyword search first. If keywords are too generic or empty after
-    filtering, falls back to searching by the full outlet name (ilike) so
-    the branch is never left with zero candidates to pick from.
+    This is intentionally a constrained name search, not a full SWAG
+    customer directory. It provides a recovery path when the two Odoo
+    systems format the same outlet name differently without allowing a
+    branch to attach an unrelated customer.
     """
     brand_words = _brand_keywords(branch_info.get("company_name"))
     keywords = _brand_keywords(branch_info.get("name")) - brand_words
-
-    if keywords:
-        terms = [["name", "ilike", keyword] for keyword in sorted(keywords)]
-        domain = [terms[0]] if len(terms) == 1 else (["|"] * (len(terms) - 1)) + terms
-        results = swag_execute(
-            "res.partner", "search_read", [domain],
-            {"fields": ["id", "name", "city", "street"], "limit": 40, "order": "name asc"},
-        )
-        if results:
-            return results
-
-    # Fallback: search by the full outlet name (handles cases where all
-    # keywords were generic or got subtracted by the company name filter)
-    outlet_name = (branch_info.get("name") or "").strip()
-    if not outlet_name:
+    if not keywords:
         return []
+
+    terms = [["name", "ilike", keyword] for keyword in sorted(keywords)]
+    domain = [terms[0]] if len(terms) == 1 else (["|"] * (len(terms) - 1)) + terms
     return swag_execute(
-        "res.partner", "search_read", [[["name", "ilike", outlet_name]]],
+        "res.partner", "search_read", [domain],
         {"fields": ["id", "name", "city", "street"], "limit": 40, "order": "name asc"},
     )
 
@@ -812,16 +802,26 @@ def branch_select_search(body: BranchSearchRequest):
 
     q = body.q.strip()
     candidate_ids = [int(candidate_id) for candidate_id in payload.get("candidate_ids", [])]
-    if not candidate_ids:
-        return {"results": []}
-    domain = [["id", "in", candidate_ids]]
-    if q:
-        domain = ["&", domain[0], ["name", "ilike", q]]
-    results = swag_execute(
-        "res.partner", "search_read", [domain],
-        {"fields": ["id", "name", "city", "street"], "limit": 25, "order": "name asc"},
-    )
-    return {"results": results}
+
+    if candidate_ids:
+        # Normal flow: search within pre-matched candidates only
+        domain = [["id", "in", candidate_ids]]
+        if q:
+            domain = ["&", domain[0], ["name", "ilike", q]]
+        results = swag_execute(
+            "res.partner", "search_read", [domain],
+            {"fields": ["id", "name", "city", "street"], "limit": 25, "order": "name asc"},
+        )
+    else:
+        # Fallback: no candidates pre-matched, allow free search across all SWAG customers
+        # Require at least 2 chars to avoid returning the entire database
+        if not q or len(q) < 2:
+            return {"results": [], "free_search": True}
+        results = swag_execute(
+            "res.partner", "search_read", [[["name", "ilike", q]]],
+            {"fields": ["id", "name", "city", "street"], "limit": 25, "order": "name asc"},
+        )
+    return {"results": results, "free_search": not candidate_ids}
 
 
 @app.post("/api/confirm-branch")
@@ -838,12 +838,14 @@ def confirm_branch(body: ConfirmBranchRequest):
         raise HTTPException(401, "This branch selection expired — please start again.")
 
     candidate_ids = {int(candidate_id) for candidate_id in payload.get("candidate_ids", [])}
-    if body.partner_id not in candidate_ids:
+    if candidate_ids and body.partner_id not in candidate_ids:
         raise HTTPException(
             403,
             "That SWAG customer was not one of the verified candidates for this outlet. "
             "Search and select a customer from this branch's list.",
         )
+    # If candidate_ids is empty, the branch used free-text search — any valid SWAG
+    # partner is acceptable (the human is making an explicit conscious choice).
 
     partner_recs = swag_execute("res.partner", "read", [[body.partner_id]], {"fields": ["name"]})
     if not partner_recs:
