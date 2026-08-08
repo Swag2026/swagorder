@@ -421,7 +421,7 @@ def find_branch_partner_candidates(branch_info: dict) -> list[dict]:
         return []
 
     terms = [["name", "ilike", keyword] for keyword in sorted(keywords)]
-    domain = terms[0] if len(terms) == 1 else (["|"] * (len(terms) - 1)) + terms
+    domain = [terms[0]] if len(terms) == 1 else (["|"] * (len(terms) - 1)) + terms
     return swag_execute(
         "res.partner", "search_read", [domain],
         {"fields": ["id", "name", "city", "street"], "limit": 40, "order": "name asc"},
