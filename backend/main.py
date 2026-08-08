@@ -410,20 +410,30 @@ def auto_resolve_swag_partner(branch_info: dict):
 def find_branch_partner_candidates(branch_info: dict) -> list[dict]:
     """Find review candidates from the outlet name only.
 
-    This is intentionally a constrained name search, not a full SWAG
-    customer directory. It provides a recovery path when the two Odoo
-    systems format the same outlet name differently without allowing a
-    branch to attach an unrelated customer.
+    Tries keyword search first. If keywords are too generic or empty after
+    filtering, falls back to searching by the full outlet name (ilike) so
+    the branch is never left with zero candidates to pick from.
     """
     brand_words = _brand_keywords(branch_info.get("company_name"))
     keywords = _brand_keywords(branch_info.get("name")) - brand_words
-    if not keywords:
-        return []
 
-    terms = [["name", "ilike", keyword] for keyword in sorted(keywords)]
-    domain = terms if len(terms) == 1 else (["|"] * (len(terms) - 1)) + terms
+    if keywords:
+        terms = [["name", "ilike", keyword] for keyword in sorted(keywords)]
+        domain = [terms[0]] if len(terms) == 1 else (["|"] * (len(terms) - 1)) + terms
+        results = swag_execute(
+            "res.partner", "search_read", [domain],
+            {"fields": ["id", "name", "city", "street"], "limit": 40, "order": "name asc"},
+        )
+        if results:
+            return results
+
+    # Fallback: search by the full outlet name (handles cases where all
+    # keywords were generic or got subtracted by the company name filter)
+    outlet_name = (branch_info.get("name") or "").strip()
+    if not outlet_name:
+        return []
     return swag_execute(
-        "res.partner", "search_read", [domain],
+        "res.partner", "search_read", [[["name", "ilike", outlet_name]]],
         {"fields": ["id", "name", "city", "street"], "limit": 40, "order": "name asc"},
     )
 
@@ -1498,6 +1508,7 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
     return order_id, details
 
 
+@app.post("/api/orders")
 def check_branch_order_limit(branch_key: str, new_order_value: float):
     daily_limit, monthly_limit = database.get_branch_limits(branch_key)
     if daily_limit is None and monthly_limit is None:
@@ -1543,7 +1554,6 @@ def check_maintenance_mode():
         raise HTTPException(503, message)
 
 
-@app.post("/api/orders")
 def create_order(body: OrderRequest, authorization: str | None = Header(None)):
     payload = read_token(authorization)
     check_maintenance_mode()
@@ -1757,16 +1767,36 @@ def bulk_lookup_products(body: BulkLookupRequest, authorization: str | None = He
 
 @app.get("/api/products/by-barcode")
 def product_by_barcode(code: str, authorization: str | None = Header(None)):
-    """Used by the barcode scanner — look up a product by its exact barcode."""
+    """Used by the barcode scanner — look up a product by its barcode.
+    Tries an exact match first (fast, precise), then falls back to
+    leading-zero variants and a partial match — some scanners/labels differ
+    slightly in exactly how the digits are formatted."""
     read_token(authorization)
     code = (code or "").strip()
     if not code:
         raise HTTPException(400, "No barcode provided.")
-    recs = swag_execute(
-        "product.product", "search_read",
-        [[["barcode", "=", code]]],
-        {"fields": ["id", "default_code", "name", "list_price", "qty_available"]},
-    )
+
+    fields = ["id", "default_code", "name", "list_price", "qty_available"]
+
+    recs = swag_execute("product.product", "search_read", [[["barcode", "=", code]]], {"fields": fields})
+
+    if not recs:
+        # Try with/without a leading zero — a common source of mismatch
+        # between what a scanner outputs and what's stored.
+        variants = {code.lstrip("0"), "0" + code}
+        variants.discard(code)
+        for variant in variants:
+            if not variant:
+                continue
+            recs = swag_execute("product.product", "search_read", [[["barcode", "=", variant]]], {"fields": fields})
+            if recs:
+                break
+
+    if not recs:
+        # Last resort: partial match, in case of stray characters/whitespace
+        # baked into the stored barcode value.
+        recs = swag_execute("product.product", "search_read", [[["barcode", "ilike", code]]], {"fields": fields})
+
     if not recs:
         raise HTTPException(404, f"No product found with barcode {code}.")
     if len(recs) > 1:
