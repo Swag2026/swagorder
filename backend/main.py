@@ -318,7 +318,7 @@ def _norm(s: str | None) -> str:
 
 _GENERIC_NAME_WORDS = {
     "شركة", "التجارية", "فرع", "فروع", "مؤسسة", "المحدودة", "مجموعة", "متجر", "معرض",
-    "مستودع", "للأزياء", "التجاري", "مصنع", "محل", "مكتب", "co", "company", "trading",
+    "مستودع", "سوق", "للأزياء", "التجاري", "مصنع", "محل", "مكتب", "co", "company", "trading",
     "branch", "store", "shop", "warehouse", "ltd", "llc", "est", "establishment",
 }
 
@@ -410,20 +410,29 @@ def auto_resolve_swag_partner(branch_info: dict):
 def find_branch_partner_candidates(branch_info: dict) -> list[dict]:
     """Find review candidates from the outlet name only.
 
-    This is intentionally a constrained name search, not a full SWAG
-    customer directory. It provides a recovery path when the two Odoo
-    systems format the same outlet name differently without allowing a
-    branch to attach an unrelated customer.
+    Tries keyword search first. If keywords are empty or return nothing,
+    falls back to full outlet name ilike search so the branch always gets
+    candidates to pick from.
     """
     brand_words = _brand_keywords(branch_info.get("company_name"))
     keywords = _brand_keywords(branch_info.get("name")) - brand_words
-    if not keywords:
-        return []
 
-    terms = [["name", "ilike", keyword] for keyword in sorted(keywords)]
-    domain = [terms[0]] if len(terms) == 1 else (["|"] * (len(terms) - 1)) + terms
+    if keywords:
+        terms = [["name", "ilike", keyword] for keyword in sorted(keywords)]
+        domain = [terms[0]] if len(terms) == 1 else (["|"] * (len(terms) - 1)) + terms
+        results = swag_execute(
+            "res.partner", "search_read", [domain],
+            {"fields": ["id", "name", "city", "street"], "limit": 40, "order": "name asc"},
+        )
+        if results:
+            return results
+
+    # Fallback: search by full outlet name
+    outlet_name = (branch_info.get("name") or "").strip()
+    if not outlet_name:
+        return []
     return swag_execute(
-        "res.partner", "search_read", [domain],
+        "res.partner", "search_read", [[["name", "ilike", outlet_name]]],
         {"fields": ["id", "name", "city", "street"], "limit": 40, "order": "name asc"},
     )
 
@@ -804,7 +813,6 @@ def branch_select_search(body: BranchSearchRequest):
     candidate_ids = [int(candidate_id) for candidate_id in payload.get("candidate_ids", [])]
 
     if candidate_ids:
-        # Normal flow: search within pre-matched candidates only
         domain = [["id", "in", candidate_ids]]
         if q:
             domain = ["&", domain[0], ["name", "ilike", q]]
@@ -813,8 +821,7 @@ def branch_select_search(body: BranchSearchRequest):
             {"fields": ["id", "name", "city", "street"], "limit": 25, "order": "name asc"},
         )
     else:
-        # Fallback: no candidates pre-matched, allow free search across all SWAG customers
-        # Require at least 2 chars to avoid returning the entire database
+        # No pre-matched candidates — allow free search across all SWAG customers
         if not q or len(q) < 2:
             return {"results": [], "free_search": True}
         results = swag_execute(
@@ -844,8 +851,7 @@ def confirm_branch(body: ConfirmBranchRequest):
             "That SWAG customer was not one of the verified candidates for this outlet. "
             "Search and select a customer from this branch's list.",
         )
-    # If candidate_ids is empty, the branch used free-text search — any valid SWAG
-    # partner is acceptable (the human is making an explicit conscious choice).
+    # If candidate_ids empty, branch used free search — any valid partner allowed.
 
     partner_recs = swag_execute("res.partner", "read", [[body.partner_id]], {"fields": ["name"]})
     if not partner_recs:
@@ -1510,7 +1516,6 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
     return order_id, details
 
 
-@app.post("/api/orders")
 def check_branch_order_limit(branch_key: str, new_order_value: float):
     daily_limit, monthly_limit = database.get_branch_limits(branch_key)
     if daily_limit is None and monthly_limit is None:
@@ -1556,6 +1561,7 @@ def check_maintenance_mode():
         raise HTTPException(503, message)
 
 
+@app.post("/api/orders")
 def create_order(body: OrderRequest, authorization: str | None = Header(None)):
     payload = read_token(authorization)
     check_maintenance_mode()
