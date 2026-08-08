@@ -85,10 +85,17 @@ def load_branch_partner_map() -> dict:
         return {}
     try:
         raw = json.loads(MAP_FILE.read_text())
-        if raw.get("version") != MAPPING_VERSION:
-            return {}
-        mappings = raw.get("mappings")
-        if not isinstance(mappings, dict):
+        if isinstance(raw, dict) and raw.get("version") == MAPPING_VERSION:
+            mappings = raw.get("mappings")
+            if not isinstance(mappings, dict):
+                return {}
+        elif isinstance(raw, dict):
+            # Upgrade compatibility: the previous release stored the map as
+            # {warehouse_id: partner_id}. Keep those explicit human/admin
+            # selections usable, while every new write uses the versioned,
+            # branch-safe format above.
+            mappings = raw
+        else:
             return {}
         return {str(k): int(v) for k, v in mappings.items()}
     except Exception:
@@ -194,6 +201,26 @@ def laroche_execute_as(uid: int, password: str, model: str, method: str, args: l
         raise HTTPException(400, f"LAROUCHE Odoo error: {e.faultString}")
     except Exception as e:
         raise HTTPException(502, f"Could not reach LAROUCHE Odoo: {e}")
+
+
+def laroche_optional_read(uid: int, password: str, model: str, record_id: int, fields: list[str]) -> list[dict]:
+    """Read optional profile fields without turning a login into a 400.
+
+    Some LAROUCHE databases expose ``res.users`` fields in metadata but do
+    not allow every employee to read them. Login only needs the employee name
+    and company; an unavailable optional field must not block authentication.
+    """
+    try:
+        return laroche_execute_as(
+            uid,
+            password,
+            model,
+            "read",
+            [[record_id]],
+            {"fields": fields},
+        )
+    except HTTPException:
+        return []
 
 
 _laroche_admin_uid_cache: int | None = None
@@ -563,15 +590,24 @@ def login(body: LoginRequest):
     email = body.email.strip()
     uid = laroche_authenticate(email, body.password)
 
-    # Read defensively — property_warehouse_id may not exist on every setup.
-    wanted_fields = ["name", "company_id", "property_warehouse_id"]
+    # Read defensively — custom warehouse fields may be absent or restricted
+    # for employee accounts. The basic identity read must remain sufficient
+    # for login; the optional warehouse lookup is attempted separately.
+    identity_fields = ["name", "company_id"]
     try:
         meta = laroche_execute_as(uid, body.password, "res.users", "fields_get", [], {"attributes": []})
-        existing_fields = [f for f in wanted_fields if f in meta]
+        optional_warehouse_field = next(
+            (
+                field
+                for field in ("property_warehouse_id", "default_warehouse_id", "warehouse_id")
+                if field in meta
+            ),
+            None,
+        )
     except Exception:
-        existing_fields = ["name", "company_id"]
+        optional_warehouse_field = None
 
-    user_recs = laroche_execute_as(uid, body.password, "res.users", "read", [[uid]], {"fields": existing_fields})
+    user_recs = laroche_execute_as(uid, body.password, "res.users", "read", [[uid]], {"fields": identity_fields})
     if not user_recs:
         raise HTTPException(500, "Could not load your LAROUCHE user profile.")
     employee_name = user_recs[0]["name"]
@@ -580,7 +616,16 @@ def login(body: LoginRequest):
         raise HTTPException(500, "Your LAROUCHE account has no company/brand assigned — ask an admin to check it.")
     company_id, company_name = company[0], company[1]
 
-    own_warehouse = user_recs[0].get("property_warehouse_id") or False
+    own_warehouse = False
+    if optional_warehouse_field:
+        optional_recs = laroche_optional_read(
+            uid,
+            body.password,
+            "res.users",
+            uid,
+            [optional_warehouse_field],
+        )
+        own_warehouse = optional_recs[0].get(optional_warehouse_field) if optional_recs else False
     if own_warehouse:
         # This login is already scoped to exactly one outlet — resolve
         # straight through, skipping the picker (and any access to other
