@@ -68,6 +68,76 @@ class OrderRecord(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
 
+class BranchOrderLimit(Base):
+    """Optional daily/monthly spending caps admin can set per branch."""
+    __tablename__ = "branch_order_limits"
+
+    branch_key = Column(String, primary_key=True)
+    daily_limit = Column(Float, nullable=True)
+    monthly_limit = Column(Float, nullable=True)
+
+
+class HiddenProduct(Base):
+    """A product hidden from a specific branch's catalog by admin."""
+    __tablename__ = "hidden_products"
+
+    id = Column(Integer, primary_key=True)
+    product_id = Column(Integer, index=True)
+    branch_key = Column(String, index=True)
+
+
+class AdminAuditLog(Base):
+    """Every meaningful admin action, for a full accountability trail."""
+    __tablename__ = "admin_audit_log"
+
+    id = Column(Integer, primary_key=True)
+    action = Column(String)
+    details = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class BranchAccessControl(Base):
+    """Admin can flip a branch's access to this portal on/off without
+    touching their real LAROUCHE account."""
+    __tablename__ = "branch_access_control"
+
+    branch_key = Column(String, primary_key=True)
+    is_disabled = Column(Integer, default=0)  # 0/1 (SQLite-friendly boolean)
+    reason = Column(String, nullable=True)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class ProductMinOverride(Base):
+    """Per-product minimum order quantity, set by admin — overrides the
+    global default (4 pieces) for specific products."""
+    __tablename__ = "product_min_overrides"
+
+    product_id = Column(Integer, primary_key=True)
+    min_qty = Column(Integer)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class SystemSetting(Base):
+    """Simple key/value store for global toggles (e.g. maintenance mode)."""
+    __tablename__ = "system_settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(String)
+
+
+class OrderTemplate(Base):
+    """A saved cart a branch can name and reuse later (e.g. 'Weekly
+    Standard', 'Eid Stock') — one click loads the whole thing back into
+    the cart instead of re-searching everything."""
+    __tablename__ = "order_templates"
+
+    id = Column(Integer, primary_key=True)
+    branch_key = Column(String, index=True)
+    name = Column(String)
+    items_json = Column(Text)  # JSON list of {product_id, default_code, name, qty, price, packaging_id, packaging_qty}
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
 class StockReservation(Base):
     """A short-lived hold on stock while a product sits in someone's cart —
     so a second branch searching the same product sees it as (partly)
@@ -135,5 +205,185 @@ def log_order(**kwargs):
     try:
         db.add(OrderRecord(**kwargs))
         db.commit()
+    finally:
+        db.close()
+
+
+def is_branch_disabled(branch_key: str) -> tuple[bool, str | None]:
+    db = get_session()
+    try:
+        row = db.query(BranchAccessControl).filter(BranchAccessControl.branch_key == str(branch_key)).first()
+        if row and row.is_disabled:
+            return True, row.reason
+        return False, None
+    finally:
+        db.close()
+
+
+def set_branch_disabled(branch_key: str, disabled: bool, reason: str | None = None):
+    db = get_session()
+    try:
+        row = db.query(BranchAccessControl).filter(BranchAccessControl.branch_key == str(branch_key)).first()
+        if row:
+            row.is_disabled = 1 if disabled else 0
+            row.reason = reason
+            row.updated_at = datetime.now(timezone.utc)
+        else:
+            db.add(BranchAccessControl(branch_key=str(branch_key), is_disabled=1 if disabled else 0, reason=reason))
+        db.commit()
+    finally:
+        db.close()
+
+
+def get_product_min_qty(product_id: int, default: int = 4) -> int:
+    db = get_session()
+    try:
+        row = db.query(ProductMinOverride).filter(ProductMinOverride.product_id == product_id).first()
+        return row.min_qty if row else default
+    finally:
+        db.close()
+
+
+def get_all_min_overrides() -> dict:
+    db = get_session()
+    try:
+        rows = db.query(ProductMinOverride).all()
+        return {r.product_id: r.min_qty for r in rows}
+    finally:
+        db.close()
+
+
+def set_product_min_qty(product_id: int, min_qty: int):
+    db = get_session()
+    try:
+        row = db.query(ProductMinOverride).filter(ProductMinOverride.product_id == product_id).first()
+        if row:
+            row.min_qty = min_qty
+            row.updated_at = datetime.now(timezone.utc)
+        else:
+            db.add(ProductMinOverride(product_id=product_id, min_qty=min_qty))
+        db.commit()
+    finally:
+        db.close()
+
+
+def delete_product_min_override(product_id: int):
+    db = get_session()
+    try:
+        db.query(ProductMinOverride).filter(ProductMinOverride.product_id == product_id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    db = get_session()
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == key).first()
+        return row.value if row else default
+    finally:
+        db.close()
+
+
+def set_setting(key: str, value: str):
+    db = get_session()
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == key).first()
+        if row:
+            row.value = value
+        else:
+            db.add(SystemSetting(key=key, value=value))
+        db.commit()
+    finally:
+        db.close()
+
+
+def log_admin_action(action: str, details: str = ""):
+    db = get_session()
+    try:
+        db.add(AdminAuditLog(action=action, details=details))
+        db.commit()
+    finally:
+        db.close()
+
+
+def get_branch_limits(branch_key: str):
+    db = get_session()
+    try:
+        row = db.query(BranchOrderLimit).filter(BranchOrderLimit.branch_key == str(branch_key)).first()
+        if not row:
+            return None, None
+        return row.daily_limit, row.monthly_limit
+    finally:
+        db.close()
+
+
+def set_branch_limits(branch_key: str, daily_limit, monthly_limit):
+    db = get_session()
+    try:
+        row = db.query(BranchOrderLimit).filter(BranchOrderLimit.branch_key == str(branch_key)).first()
+        if row:
+            row.daily_limit = daily_limit
+            row.monthly_limit = monthly_limit
+        else:
+            db.add(BranchOrderLimit(branch_key=str(branch_key), daily_limit=daily_limit, monthly_limit=monthly_limit))
+        db.commit()
+    finally:
+        db.close()
+
+
+def is_product_hidden(product_id: int, branch_key: str) -> bool:
+    db = get_session()
+    try:
+        row = (
+            db.query(HiddenProduct)
+            .filter(HiddenProduct.product_id == product_id, HiddenProduct.branch_key == str(branch_key))
+            .first()
+        )
+        return row is not None
+    finally:
+        db.close()
+
+
+def get_hidden_product_ids_for_branch(branch_key: str) -> set:
+    db = get_session()
+    try:
+        rows = db.query(HiddenProduct).filter(HiddenProduct.branch_key == str(branch_key)).all()
+        return {r.product_id for r in rows}
+    finally:
+        db.close()
+
+
+def hide_product(product_id: int, branch_key: str):
+    db = get_session()
+    try:
+        exists = (
+            db.query(HiddenProduct)
+            .filter(HiddenProduct.product_id == product_id, HiddenProduct.branch_key == str(branch_key))
+            .first()
+        )
+        if not exists:
+            db.add(HiddenProduct(product_id=product_id, branch_key=str(branch_key)))
+            db.commit()
+    finally:
+        db.close()
+
+
+def unhide_product(product_id: int, branch_key: str):
+    db = get_session()
+    try:
+        db.query(HiddenProduct).filter(
+            HiddenProduct.product_id == product_id, HiddenProduct.branch_key == str(branch_key)
+        ).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def list_hidden_products():
+    db = get_session()
+    try:
+        rows = db.query(HiddenProduct).all()
+        return [{"product_id": r.product_id, "branch_key": r.branch_key} for r in rows]
     finally:
         db.close()
