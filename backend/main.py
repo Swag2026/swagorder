@@ -426,6 +426,9 @@ def read_token(authorization: str | None) -> dict:
         raise HTTPException(401, "Invalid session token.")
     if payload.get("type") != "session":
         raise HTTPException(401, "Invalid session token.")
+    disabled, reason = database.is_branch_disabled(payload["branch_key"])
+    if disabled:
+        raise HTTPException(403, f"Access to this portal has been disabled by admin" + (f": {reason}" if reason else "."))
     return payload
 
 
@@ -610,6 +613,9 @@ def _resolve_branch(branch_id: int, branch_name: str, branch_info: dict, employe
     """Shared logic: look up cached mapping, else auto-resolve, else return a
     selection_required payload."""
     key = str(branch_id)
+    disabled, reason = database.is_branch_disabled(key)
+    if disabled:
+        raise HTTPException(403, "This outlet's access has been disabled by admin" + (f": {reason}" if reason else "."))
     mapping = load_branch_partner_map()
     swag_partner_id = mapping.get(key) or _resolved_cache.get(key)
     matched_on = "saved mapping" if swag_partner_id else None
@@ -785,7 +791,7 @@ def report_wrong_customer(authorization: str | None = Header(None)):
 
 @app.get("/api/products")
 def search_products(q: str = "", limit: int = 10, authorization: str | None = Header(None)):
-    read_token(authorization)
+    payload = read_token(authorization)
     domain = [["sale_ok", "=", True]]
     q = (q or "").strip()
     if q:
@@ -795,6 +801,12 @@ def search_products(q: str = "", limit: int = 10, authorization: str | None = He
         "product.product", "search_read",
         [domain], {"fields": fields, "limit": limit, "order": "default_code asc"},
     )
+    hidden_ids = database.get_hidden_product_ids_for_branch(payload["branch_key"])
+    if hidden_ids:
+        products = [p for p in products if p["id"] not in hidden_ids]
+    overrides = database.get_all_min_overrides()
+    for p in products:
+        p["min_qty"] = overrides.get(p["id"], 4)
     return {"products": products}
 
 
@@ -1376,8 +1388,54 @@ def _create_swag_order(swag_partner_id, items, warehouse_id, note, employee_name
 
 
 @app.post("/api/orders")
+def check_branch_order_limit(branch_key: str, new_order_value: float):
+    daily_limit, monthly_limit = database.get_branch_limits(branch_key)
+    if daily_limit is None and monthly_limit is None:
+        return
+    db = database.get_session()
+    try:
+        now = datetime.now(timezone.utc)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        rows = (
+            db.query(database.OrderRecord)
+            .filter(database.OrderRecord.branch_key == branch_key)
+            .all()
+        )
+        today_total = sum(
+            r.amount_total or 0 for r in rows
+            if (r.created_at if r.created_at.tzinfo else r.created_at.replace(tzinfo=timezone.utc)) >= day_start
+        )
+        month_total = sum(
+            r.amount_total or 0 for r in rows
+            if (r.created_at if r.created_at.tzinfo else r.created_at.replace(tzinfo=timezone.utc)) >= month_start
+        )
+    finally:
+        db.close()
+
+    if daily_limit is not None and today_total + new_order_value > daily_limit:
+        raise HTTPException(
+            403,
+            f"This would exceed your branch's daily order limit ({daily_limit}). "
+            f"Already ordered {today_total:.2f} today.",
+        )
+    if monthly_limit is not None and month_total + new_order_value > monthly_limit:
+        raise HTTPException(
+            403,
+            f"This would exceed your branch's monthly order limit ({monthly_limit}). "
+            f"Already ordered {month_total:.2f} this month.",
+        )
+
+
+def check_maintenance_mode():
+    if database.get_setting("maintenance_mode") == "1":
+        message = database.get_setting("maintenance_message") or "Ordering is temporarily paused for maintenance. Please try again shortly."
+        raise HTTPException(503, message)
+
+
 def create_order(body: OrderRequest, authorization: str | None = Header(None)):
     payload = read_token(authorization)
+    check_maintenance_mode()
     if not body.items:
         raise HTTPException(400, "Cart is empty.")
 
@@ -1387,6 +1445,16 @@ def create_order(body: OrderRequest, authorization: str | None = Header(None)):
         for it in body.items
     ]
     verify_stock_before_order(items, body.warehouse_id, payload["branch_key"])
+
+    estimated_value = 0.0
+    for it in items:
+        try:
+            recs = swag_execute("product.product", "read", [[it["product_id"]]], {"fields": ["list_price"]})
+            estimated_value += it["qty"] * (recs[0]["list_price"] if recs else 0)
+        except Exception:
+            pass
+    check_branch_order_limit(payload["branch_key"], estimated_value)
+
     order_id, details = _create_swag_order(
         payload["swag_partner_id"], items, body.warehouse_id, body.note,
         employee_name, payload.get("branch_name"), payload["branch_key"],
@@ -1486,6 +1554,7 @@ def list_pending_orders(authorization: str | None = Header(None)):
 def approve_pending_order(pending_id: int, body: DecidePendingRequest, authorization: str | None = Header(None)):
     """Approve a pending order — THIS is when it actually gets created in SWAG."""
     payload = read_token(authorization)
+    check_maintenance_mode()
     db = database.get_session()
     try:
         row = db.query(database.PendingOrder).filter(database.PendingOrder.id == pending_id).first()
@@ -1507,6 +1576,7 @@ def approve_pending_order(pending_id: int, body: DecidePendingRequest, authoriza
             for i in items
         ]
         verify_stock_before_order(order_items, row.warehouse_id, row.branch_key)
+        check_branch_order_limit(row.branch_key, row.amount_total or 0)
         order_id, details = _create_swag_order(
             row.swag_partner_id, order_items, row.warehouse_id, row.note,
             row.requested_by, row.branch_name, row.branch_key,
@@ -2027,6 +2097,7 @@ def admin_clear_mapping(body: ClearMappingRequest, authorization: str | None = H
         del mapping[body.branch_key]
         save_branch_partner_map(mapping)
     _resolved_cache.pop(body.branch_key, None)
+    database.log_admin_action("mapping_cleared", f"branch_key={body.branch_key}")
     return {"ok": True}
 
 
@@ -2035,7 +2106,12 @@ def admin_clear_mapping(body: ClearMappingRequest, authorization: str | None = H
 # two branches don't both try to order the last few pieces of the same
 # product from the same warehouse at the same time.
 # ─────────────────────────────────────────────────────────────────────────────
-RESERVATION_TTL_MINUTES = 15
+def reservation_ttl_minutes() -> int:
+    val = database.get_setting("reservation_ttl_minutes")
+    try:
+        return int(val) if val else 15
+    except ValueError:
+        return 15
 
 
 class ReserveRequest(BaseModel):
@@ -2092,14 +2168,24 @@ def verify_stock_before_order(items: list[dict], warehouse_id: int | None, branc
     shown a few minutes ago in the catalog may have moved on. Raises a clear
     409 error naming exactly which product(s) fell short, instead of letting
     SWAG silently oversell."""
-    if not warehouse_id:
-        return  # no specific warehouse chosen — nothing to verify against
     shortfalls = []
-    for item in items:
-        available = get_available_stock(item["product_id"], warehouse_id, branch_key)
-        needed = item["qty"]
-        if needed > available:
-            shortfalls.append(f"product #{item['product_id']} (need {needed}, only {available} left)")
+    if warehouse_id:
+        for item in items:
+            available = get_available_stock(item["product_id"], warehouse_id, branch_key)
+            needed = item["qty"]
+            if needed > available:
+                shortfalls.append(f"product #{item['product_id']} (need {needed}, only {available} left)")
+    else:
+        # No specific warehouse was chosen (e.g. an older "Reorder" flow) —
+        # we can't check one exact warehouse, but we can still confirm the
+        # product isn't fully out of stock everywhere before letting it
+        # through, rather than skipping verification entirely.
+        for item in items:
+            recs = swag_execute("product.product", "read", [[item["product_id"]]], {"fields": ["qty_available"]})
+            available = recs[0]["qty_available"] if recs else 0
+            needed = item["qty"]
+            if needed > available:
+                shortfalls.append(f"product #{item['product_id']} (need {needed}, only {available} left anywhere)")
     if shortfalls:
         raise HTTPException(
             409,
@@ -2126,7 +2212,8 @@ def upsert_reservation(body: ReserveRequest, authorization: str | None = Header(
             )
             .first()
         )
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=RESERVATION_TTL_MINUTES)
+        ttl = reservation_ttl_minutes()
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=ttl)
         if row:
             row.qty = body.qty
             row.expires_at = expires_at
@@ -2136,7 +2223,7 @@ def upsert_reservation(body: ReserveRequest, authorization: str | None = Header(
                 branch_key=branch_key, qty=body.qty, expires_at=expires_at,
             ))
         db.commit()
-        return {"ok": True, "expires_in_minutes": RESERVATION_TTL_MINUTES}
+        return {"ok": True, "expires_in_minutes": ttl}
     finally:
         db.close()
 
@@ -2159,3 +2246,470 @@ def release_reservation(product_id: int, warehouse_id: int, authorization: str |
         return {"ok": True}
     finally:
         db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORDER TEMPLATES — save the current cart under a name, reuse it later.
+# ─────────────────────────────────────────────────────────────────────────────
+class SaveTemplateRequest(BaseModel):
+    name: str
+    items: list[dict]  # [{product_id, default_code, name, qty, price, packaging_id, packaging_qty}]
+
+
+@app.post("/api/templates")
+def save_template(body: SaveTemplateRequest, authorization: str | None = Header(None)):
+    payload = read_token(authorization)
+    if not body.items:
+        raise HTTPException(400, "Cart is empty — nothing to save.")
+    db = database.get_session()
+    try:
+        row = database.OrderTemplate(
+            branch_key=payload["branch_key"],
+            name=body.name.strip() or "Untitled",
+            items_json=json.dumps(body.items),
+        )
+        db.add(row)
+        db.commit()
+        return {"ok": True, "id": row.id}
+    finally:
+        db.close()
+
+
+@app.get("/api/templates")
+def list_templates(authorization: str | None = Header(None)):
+    payload = read_token(authorization)
+    db = database.get_session()
+    try:
+        rows = (
+            db.query(database.OrderTemplate)
+            .filter(database.OrderTemplate.branch_key == payload["branch_key"])
+            .order_by(database.OrderTemplate.created_at.desc())
+            .all()
+        )
+        return {
+            "templates": [
+                {
+                    "id": r.id,
+                    "name": r.name,
+                    "item_count": len(json.loads(r.items_json or "[]")),
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in rows
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/templates/{template_id}")
+def get_template(template_id: int, authorization: str | None = Header(None)):
+    payload = read_token(authorization)
+    db = database.get_session()
+    try:
+        row = db.query(database.OrderTemplate).filter(database.OrderTemplate.id == template_id).first()
+        if not row:
+            raise HTTPException(404, "Template not found.")
+        if row.branch_key != payload["branch_key"]:
+            raise HTTPException(403, "This template doesn't belong to your outlet.")
+        return {"id": row.id, "name": row.name, "items": json.loads(row.items_json or "[]")}
+    finally:
+        db.close()
+
+
+@app.delete("/api/templates/{template_id}")
+def delete_template(template_id: int, authorization: str | None = Header(None)):
+    payload = read_token(authorization)
+    db = database.get_session()
+    try:
+        row = db.query(database.OrderTemplate).filter(database.OrderTemplate.id == template_id).first()
+        if not row:
+            raise HTTPException(404, "Template not found.")
+        if row.branch_key != payload["branch_key"]:
+            raise HTTPException(403, "This template doesn't belong to your outlet.")
+        db.delete(row)
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANOMALY DETECTION — warn if a quantity is way above this branch's own
+# historical average for that product, catching typos before they're submitted.
+# ─────────────────────────────────────────────────────────────────────────────
+class AnomalyCheckRequest(BaseModel):
+    items: list[dict]  # [{product_id, qty}]
+
+
+@app.post("/api/check-anomaly")
+def check_anomaly(body: AnomalyCheckRequest, authorization: str | None = Header(None)):
+    payload = read_token(authorization)
+    db = database.get_session()
+    try:
+        past_orders = (
+            db.query(database.OrderRecord)
+            .filter(database.OrderRecord.branch_key == payload["branch_key"])
+            .all()
+        )
+    finally:
+        db.close()
+
+    # Build a history of quantities ordered per product, from past orders.
+    history: dict[int, list[float]] = {}
+    for o in past_orders:
+        try:
+            items = json.loads(o.items_json or "[]")
+        except Exception:
+            continue
+        for it in items:
+            pid = it.get("product_id")
+            if pid:
+                history.setdefault(pid, []).append(it.get("qty", 0) or 0)
+
+    warnings = []
+    for item in body.items:
+        pid = item.get("product_id")
+        qty = item.get("qty", 0) or 0
+        past_qtys = history.get(pid, [])
+        # Need at least 2 past orders of this exact product before we trust
+        # an "average" enough to flag something as unusual.
+        if len(past_qtys) < 2:
+            continue
+        avg = sum(past_qtys) / len(past_qtys)
+        if avg > 0 and qty > avg * 3:
+            warnings.append({
+                "product_id": pid,
+                "qty": qty,
+                "usual_avg": round(avg, 1),
+            })
+
+    return {"warnings": warnings}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN CONTROL — branch access, order cancel, bulk approvals, per-product
+# minimums, maintenance mode.
+# ─────────────────────────────────────────────────────────────────────────────
+class BranchAccessRequest(BaseModel):
+    disabled: bool
+    reason: str | None = None
+
+
+@app.post("/api/admin/branches/{branch_key}/access")
+def admin_set_branch_access(branch_key: str, body: BranchAccessRequest, authorization: str | None = Header(None)):
+    """Turn a branch's access to this portal on/off — their real LAROUCHE
+    account is untouched, only whether THIS app will let them in."""
+    read_admin_token(authorization)
+    database.set_branch_disabled(branch_key, body.disabled, body.reason)
+    database.log_admin_action(
+        "branch_access_disabled" if body.disabled else "branch_access_enabled",
+        f"branch_key={branch_key} reason={body.reason or ''}",
+    )
+    return {"ok": True}
+
+
+@app.get("/api/admin/branches-access")
+def admin_list_branch_access(authorization: str | None = Header(None)):
+    """Every branch currently disabled, for the admin UI to show a status list."""
+    read_admin_token(authorization)
+    db = database.get_session()
+    try:
+        rows = db.query(database.BranchAccessControl).filter(database.BranchAccessControl.is_disabled == 1).all()
+        return {"disabled": [{"branch_key": r.branch_key, "reason": r.reason} for r in rows]}
+    finally:
+        db.close()
+
+
+@app.post("/api/admin/orders/{record_id}/cancel")
+def admin_cancel_order(record_id: int, authorization: str | None = Header(None)):
+    """Cancel a real SWAG order that was placed wrongly — sets its state to
+    cancelled in SWAG directly (this is a real, immediate change there)."""
+    read_admin_token(authorization)
+    db = database.get_session()
+    try:
+        row = db.query(database.OrderRecord).filter(database.OrderRecord.id == record_id).first()
+        if not row:
+            raise HTTPException(404, "Order record not found.")
+        swag_order_id = row.swag_order_id
+    finally:
+        db.close()
+    swag_execute("sale.order", "write", [[swag_order_id], {"state": "cancel"}])
+    database.log_admin_action("order_cancelled", f"record_id={record_id} swag_order_id={swag_order_id}")
+    return {"ok": True}
+
+
+class BulkDecideRequest(BaseModel):
+    ids: list[int]
+    action: str  # "approve" | "reject"
+    reason: str | None = None
+
+
+@app.get("/api/admin/pending-orders")
+def admin_list_pending_orders(authorization: str | None = Header(None)):
+    """Every pending-approval order across ALL branches — for the admin
+    bulk-approve/reject view."""
+    read_admin_token(authorization)
+    db = database.get_session()
+    try:
+        rows = (
+            db.query(database.PendingOrder)
+            .filter(database.PendingOrder.status == "pending")
+            .order_by(database.PendingOrder.created_at.desc())
+            .all()
+        )
+        return {
+            "pending_orders": [
+                {
+                    "id": r.id,
+                    "branch_name": r.branch_name,
+                    "requested_by": r.requested_by,
+                    "items": json.loads(r.items_json),
+                    "amount_total": r.amount_total,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in rows
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/admin/pending-orders/bulk-decide")
+def admin_bulk_decide(body: BulkDecideRequest, authorization: str | None = Header(None)):
+    """Approve or reject many pending orders at once, across any branch."""
+    read_admin_token(authorization)
+    if body.action not in ("approve", "reject"):
+        raise HTTPException(400, "action must be 'approve' or 'reject'.")
+    database.log_admin_action(f"bulk_{body.action}", f"ids={body.ids}")
+
+    results = []
+    for pending_id in body.ids:
+        db = database.get_session()
+        try:
+            row = db.query(database.PendingOrder).filter(database.PendingOrder.id == pending_id).first()
+            if not row or row.status != "pending":
+                results.append({"id": pending_id, "ok": False, "error": "not found or already decided"})
+                continue
+
+            if body.action == "reject":
+                row.status = "rejected"
+                row.decided_by = "admin"
+                row.decided_at = datetime.now(timezone.utc)
+                row.note = (row.note or "") + (f"\nRejected: {body.reason}" if body.reason else "")
+                db.commit()
+                results.append({"id": pending_id, "ok": True, "status": "rejected"})
+            else:
+                items = json.loads(row.items_json)
+                order_items = [
+                    {"product_id": i["product_id"], "qty": i["qty"],
+                     "packaging_id": i.get("packaging_id"), "packaging_qty": i.get("packaging_qty")}
+                    for i in items
+                ]
+                try:
+                    check_maintenance_mode()
+                    verify_stock_before_order(order_items, row.warehouse_id, row.branch_key)
+                    order_id, details = _create_swag_order(
+                        row.swag_partner_id, order_items, row.warehouse_id, row.note,
+                        row.requested_by, row.branch_name, row.branch_key,
+                    )
+                    row.status = "approved"
+                    row.decided_by = "admin"
+                    row.decided_at = datetime.now(timezone.utc)
+                    row.swag_order_id = order_id
+                    row.swag_order_name = details["order_name"]
+                    db.commit()
+                    results.append({"id": pending_id, "ok": True, "status": "approved", "order_name": details["order_name"]})
+                except HTTPException as e:
+                    results.append({"id": pending_id, "ok": False, "error": e.detail})
+        finally:
+            db.close()
+
+    return {"results": results}
+
+
+class MinQtyRequest(BaseModel):
+    product_id: int
+    min_qty: int
+
+
+@app.get("/api/admin/product-min-overrides")
+def admin_list_min_overrides(authorization: str | None = Header(None)):
+    read_admin_token(authorization)
+    overrides = database.get_all_min_overrides()
+    result = []
+    for pid, min_qty in overrides.items():
+        name = f"Product #{pid}"
+        try:
+            recs = swag_execute("product.product", "read", [[pid]], {"fields": ["default_code", "name"]})
+            if recs:
+                name = f"{recs[0].get('default_code') or ''} {recs[0].get('name') or ''}".strip()
+        except Exception:
+            pass
+        result.append({"product_id": pid, "min_qty": min_qty, "name": name})
+    return {"overrides": result}
+
+
+@app.post("/api/admin/product-min-overrides")
+def admin_set_min_override(body: MinQtyRequest, authorization: str | None = Header(None)):
+    read_admin_token(authorization)
+    if body.min_qty < 1:
+        raise HTTPException(400, "min_qty must be at least 1.")
+    database.set_product_min_qty(body.product_id, body.min_qty)
+    database.log_admin_action("min_qty_set", f"product_id={body.product_id} min_qty={body.min_qty}")
+    return {"ok": True}
+
+
+@app.delete("/api/admin/product-min-overrides/{product_id}")
+def admin_delete_min_override(product_id: int, authorization: str | None = Header(None)):
+    read_admin_token(authorization)
+    database.delete_product_min_override(product_id)
+    database.log_admin_action("min_qty_override_removed", f"product_id={product_id}")
+    return {"ok": True}
+
+
+class MaintenanceRequest(BaseModel):
+    enabled: bool
+    message: str | None = None
+
+
+@app.get("/api/admin/maintenance")
+def admin_get_maintenance(authorization: str | None = Header(None)):
+    read_admin_token(authorization)
+    return {
+        "enabled": database.get_setting("maintenance_mode") == "1",
+        "message": database.get_setting("maintenance_message") or "",
+    }
+
+
+@app.post("/api/admin/maintenance")
+def admin_set_maintenance(body: MaintenanceRequest, authorization: str | None = Header(None)):
+    read_admin_token(authorization)
+    database.set_setting("maintenance_mode", "1" if body.enabled else "0")
+    if body.message:
+        database.set_setting("maintenance_message", body.message)
+    database.log_admin_action(
+        "maintenance_enabled" if body.enabled else "maintenance_disabled", body.message or ""
+    )
+    return {"ok": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch 2: branch spending limits, per-branch product visibility, backup
+# export, and the audit-log viewer.
+# ─────────────────────────────────────────────────────────────────────────────
+class BranchLimitRequest(BaseModel):
+    daily_limit: float | None = None
+    monthly_limit: float | None = None
+
+
+@app.post("/api/admin/branches/{branch_key}/limits")
+def admin_set_branch_limits(branch_key: str, body: BranchLimitRequest, authorization: str | None = Header(None)):
+    read_admin_token(authorization)
+    database.set_branch_limits(branch_key, body.daily_limit, body.monthly_limit)
+    database.log_admin_action(
+        "branch_limits_set",
+        f"branch_key={branch_key} daily={body.daily_limit} monthly={body.monthly_limit}",
+    )
+    return {"ok": True}
+
+
+@app.get("/api/admin/branches/{branch_key}/limits")
+def admin_get_branch_limits(branch_key: str, authorization: str | None = Header(None)):
+    read_admin_token(authorization)
+    daily, monthly = database.get_branch_limits(branch_key)
+    return {"daily_limit": daily, "monthly_limit": monthly}
+
+
+class ProductVisibilityRequest(BaseModel):
+    product_id: int
+    branch_key: str
+
+
+@app.post("/api/admin/hide-product")
+def admin_hide_product(body: ProductVisibilityRequest, authorization: str | None = Header(None)):
+    read_admin_token(authorization)
+    database.hide_product(body.product_id, body.branch_key)
+    database.log_admin_action("product_hidden", f"product_id={body.product_id} branch_key={body.branch_key}")
+    return {"ok": True}
+
+
+@app.post("/api/admin/unhide-product")
+def admin_unhide_product(body: ProductVisibilityRequest, authorization: str | None = Header(None)):
+    read_admin_token(authorization)
+    database.unhide_product(body.product_id, body.branch_key)
+    database.log_admin_action("product_unhidden", f"product_id={body.product_id} branch_key={body.branch_key}")
+    return {"ok": True}
+
+
+@app.get("/api/admin/hidden-products")
+def admin_list_hidden_products(authorization: str | None = Header(None)):
+    read_admin_token(authorization)
+    rows = database.list_hidden_products()
+    for row in rows:
+        try:
+            recs = swag_execute("product.product", "read", [[row["product_id"]]], {"fields": ["default_code", "name"]})
+            row["product_name"] = f"{recs[0].get('default_code') or ''} {recs[0].get('name') or ''}".strip() if recs else str(row["product_id"])
+        except Exception:
+            row["product_name"] = str(row["product_id"])
+    return {"hidden": rows}
+
+
+@app.get("/api/admin/audit-log")
+def admin_audit_log(limit: int = 100, authorization: str | None = Header(None)):
+    """Every meaningful admin action, most recent first — full accountability trail."""
+    read_admin_token(authorization)
+    db = database.get_session()
+    try:
+        rows = (
+            db.query(database.AdminAuditLog)
+            .order_by(database.AdminAuditLog.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return {
+            "log": [
+                {"id": r.id, "action": r.action, "details": r.details, "created_at": r.created_at.isoformat()}
+                for r in rows
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/admin/export")
+def admin_export(authorization: str | None = Header(None)):
+    """Full backup — every order, branch mapping, and pending-approval
+    record this portal knows about, as one downloadable JSON payload."""
+    read_admin_token(authorization)
+    db = database.get_session()
+    try:
+        orders = db.query(database.OrderRecord).order_by(database.OrderRecord.created_at.desc()).all()
+        pending = db.query(database.PendingOrder).order_by(database.PendingOrder.created_at.desc()).all()
+        logins = db.query(database.LoginEvent).order_by(database.LoginEvent.created_at.desc()).limit(500).all()
+    finally:
+        db.close()
+
+    return {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "orders": [
+            {
+                "swag_order_name": o.swag_order_name, "branch_name": o.branch_name,
+                "employee_name": o.employee_name, "warehouse_name": o.warehouse_name,
+                "item_count": o.item_count, "amount_total": o.amount_total,
+                "items": json.loads(o.items_json or "[]"), "created_at": o.created_at.isoformat(),
+            }
+            for o in orders
+        ],
+        "pending_orders": [
+            {
+                "branch_name": p.branch_name, "requested_by": p.requested_by, "status": p.status,
+                "amount_total": p.amount_total, "created_at": p.created_at.isoformat(),
+            }
+            for p in pending
+        ],
+        "mappings": load_branch_partner_map(),
+        "logins": [
+            {"branch_name": l.branch_name, "employee_name": l.employee_name, "created_at": l.created_at.isoformat()}
+            for l in logins
+        ],
+    }
